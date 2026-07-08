@@ -1,0 +1,2690 @@
+---
+title: "Análisis del régimen de precipitación en Cantabria: tendencias, rachas e índices de estacionalidad"
+subtitle: Bloque 2 del TFM *Estudio estadístico de variaciones meteorológicas y oceánicas en Cantabria*"
+author: "Sara Lanza Sarabia"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Sección 1 - Carga de librerías y datos
+## Bloque de librerías
+
+Cargamos las librerías necesarias para el análisis de precipitación:
+
+- `dplyr` y `tidyr`: manipulación y transformación de dataframes
+- `ggplot2`: generación de gráficos
+- `readr`: lectura eficiente de archivos CSV
+- `lubridate`: manejo y conversión de componentes de fechas
+- `zoo`: medias móviles centradas (`rollmean`) sobre series temporales
+- `patchwork`: composición de múltiples gráficos en paneles
+- `trend`: test de Mann-Kendall estándar (`mk.test`), estimador de Sen (`sens.slope`) con intervalos de confianza al 95%, y test de Pettitt
+- `modifiedmk`: test de Mann-Kendall con corrección TFPW para series con autocorrelación significativa de primer orden (`tfpwmk`)
+- `purrr`: programación funcional (map_dfr para iterar sobre meses y estaciones)
+- `tibble`: creación y manipulación de tibbles
+- `kableExtra`: formato enriquecido de tablas HTML en documentos R Markdown
+```{r librerias, message=FALSE, warning=FALSE}
+library(dplyr)       # Manipulación de datos
+library(ggplot2)     # Visualización de datos
+library(readr)       # Importación de datos
+library(lubridate)   # Manejo de fechas
+library(zoo)         # Medias móviles
+library(patchwork)   # Combinación de múltiples gráficos en una sola figura
+library(trend)       # Pruebas de tendencia (Mann-Kendall, Sen's Slope, entre otras)
+library(modifiedmk)  # Mann-Kendall modificado
+library(purrr)       # Programación funcional
+library(tibble)      # Creación de tibbles
+library(kableExtra)  # Formato de tablas
+```
+
+## Bloque de carga de datos
+Cargamos los datos diarios de las dos estaciones meteorológicas empleadas en el análisis. datos_tama corresponde a Tama (1972-2025, interior de Cantabria a 893 m) y datos_santander a Santander (1961-2025, litoral cantábrico), resultado de la fusión de los registros del Instituto Oceanográfico (1961-1977) con los datos de la AEMET (1978-2025). Ambos contienen la columna prec con la precipitación diaria en mm y las variables de fecha anio, mes y dia.
+```{r cargas_librerias, echo=TRUE, message=FALSE, warning=FALSE}
+# Cargar los datos diarios de las estaciones meteorológicas
+datos_tama <- read_csv("datosDiariosMeteo_tama_1972_to_2025.csv")
+datos_santander <- read_csv("datosDiariosMeteo_santander_1961_to_2025.csv")
+```
+
+# Sección 1: Limpieza de los datos de precipitación
+`limpiar_base()` realiza la limpieza estructural común a todos los análisis: elimina las columnas innecesarias para el análisis de precipitación y convierte las variables de fecha `anio`, `mes` y `dia` a formato numérico. Esta función actúa como base de `limpiar_precipitacion()`, que la llama internamente antes de aplicar el tratamiento específico de la columna `prec`.
+```{r funcion_limpieza_base,echo=TRUE, message=FALSE, warning=FALSE}
+# Función base para la limpieza de los datos meteorológicos
+limpiar_base <- function(df) {
+  # Eliminar las columnas que no se utilizarán en el análisis
+  df <- df[, !(names(df) %in% c("nombre","indicativo", "provincia", "fecha", "altitud", "horatmin", "horatmax",
+                                "hrMedia", "hrMax", "velmedia", "horaHrMax", "hrMin", "horaHrMin", "racha",
+                                "horaracha", "dir"))]
+  
+  # Convertir las variables de fecha a formato numérico
+  df$anio <- as.numeric(df$anio)
+  df$mes <- as.numeric(df$mes)
+  df$dia <- as.numeric(df$dia)
+  
+  return(df)
+}
+```
+
+`limpiar_precipitacion()` realiza el tratamiento completo de la columna `prec` en cinco etapas: 
+
+1. Limpieza inicial de cadenas especiales — espacios en blanco, valores _Ip_ y _Tr_ reemplazados por 0.01 mm, comas decimales convertidas a puntos, y registro previo de los días _Acum_ en la columna `es_acum`
+2. Identificación de bloques consecutivos de _Acum_ mediante `rle()`
+3. Tratamiento de los bloques acumulados según su longitud: 
+    - Si el bloque tiene como máximo `max_reparto` días (por defecto 7) y existe un valor válido en el día inmediatamente posterior, la precipitación total se reparte uniformemente entre todos los días del bloque y el día de cierre
+    - Si el bloque es más largo o no hay valor posterior, todos esos días se marcan como NA
+4. Eliminación de las columnas auxiliares
+5. Creación de las columnas derivadas _lluvia_ (`TRUE` si `prec` > 0.1 mm) y _seco_ (`TRUE` si `prec` <= 0.1 mm).
+```{r funcion_limpieza_precipitacion, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para la limpieza y tratamiento de la precipitación
+limpiar_precipitacion <- function(df, max_reparto = 7) {
+  
+  df <- limpiar_base(df)
+  
+  # =========================
+  # 1. LIMPIEZA INICIAL
+  # =========================
+  
+  df$prec <- trimws(df$prec)
+  
+  # Identificar los registros con precipitación acumulada antes de convertirlos en NA
+  df$es_acum <- df$prec == "Acum"
+  
+  # Convertir valores vacíos y "NA" en valores perdidos
+  df$prec[df$prec %in% c("", "NA")] <- NA
+  
+  # Sustituir "Acum" por NA para facilitar su tratamiento posterior
+  df$prec[df$prec == "Acum"] <- NA
+  
+  # Reemplazar códigos de precipitación por valores numéricos
+  df$prec <- gsub("Ip", "0.01", df$prec)
+  df$prec <- gsub("Tr", "0.01", df$prec)
+  df$prec <- gsub(",", ".", df$prec)
+  
+  # Convertir la precipitación a formato numérico
+  df$prec <- as.numeric(df$prec)
+  
+  # Ordenar cronológicamente los registros
+  df <- df %>% arrange(anio, mes, dia)
+  
+  # =========================
+  # 2. IDENTIFICACIÓN DE BLOQUES ACUMULADOS
+  # =========================
+  
+  rle_acum <- rle(df$es_acum) # Identificar bloques consecutivos de "Acum"
+  bloque_id <- rep(seq_along(rle_acum$lengths), times = rle_acum$lengths) # Asignar un identificador a cada bloque
+   
+  df$bloque_acum <- bloque_id
+  df$long_bloque <- rep(rle_acum$lengths, times = rle_acum$lengths)
+  
+  # =========================
+  # 3. TRATAMIENTO DE LOS VALORES ACUMULADOS
+  # =========================
+  
+  prec_new <- df$prec # Copia del vector de precipitación para aplicar las correcciones
+  
+  i <- 1
+  n <- nrow(df)
+  
+  while (i <= n) {
+    
+    if (!is.na(df$es_acum[i]) && df$es_acum[i]) {
+      
+      # Identificar el bloque completo de valores acumulados
+      bloque <- df$bloque_acum[i]
+      idx <- which(df$bloque_acum == bloque)
+      
+      # Obtener el primer valor válido tras el bloque
+      next_val <- NA
+      
+      if (max(idx) < n) {
+        next_val <- df$prec[max(idx) + 1]
+      }
+      
+      len_bloque <- length(idx)
+      
+      # =========================
+      # CASO A: BLOQUE CORTO
+      # =========================
+      
+      # Repartir la precipitación acumulada entre los días del bloque y el día siguiente
+      if (len_bloque <= max_reparto && !is.na(next_val)) {
+        
+        total <- next_val
+        reparto <- rep(total / (len_bloque + 1), len_bloque + 1)
+        prec_new[c(idx, max(idx) + 1)] <- reparto
+        
+      # Si el bloque es demasiado largo o no existe un valor posterior,
+      # la precipitación se mantiene como NA
+      } else {
+        
+        # =========================
+        # CASO B: BLOQUE LARGO
+        # =========================
+        
+        prec_new[c(idx, max(idx) + 1)] <- NA
+      }
+      
+      i <- max(idx) + 1
+    } else {
+      i <- i + 1
+    }
+  }
+  
+  # Actualizar la columna de precipitación con los valores corregidos
+  df$prec <- prec_new
+  
+  # =========================
+  # 4. LIMPIEZA FINAL
+  # =========================
+  
+  # Eliminar las variables auxiliares creadas durante el tratamiento
+  df <- df %>%
+    select(-bloque_acum, -long_bloque)
+  
+  # =========================
+  # 5. VARIABLES DERIVADAS
+  # =========================
+  
+  # Crear variables lógicas de días lluviosos y secos (umbral: 0,1 mm)
+  df$lluvia <- ifelse(is.na(df$prec), NA, df$prec > 0.1)
+  df$seco <- ifelse(is.na(df$prec), NA, df$prec <= 0.1)
+  
+  return(df)
+}
+```
+
+## Bloque de aplicación de limpieza
+Aplicamos `limpiar_precipitacion()` a ambos datasets. A continuación generamos dos versiones del dataset de Tama con propósitos distintos: 
+
+- `datos_tama_con_NA` conserva los registros con NA en prec y se usa en los análisis que requieren la serie temporal completa (rachas de sequía, análisis de continuidad)
+- `datos_tama_sin_NA` elimina esas filas y se emplea en los análisis cuantitativos que necesitan valores numéricos en todos los registros (precipitación total, intensidad, extremos, comparación entre periodos).
+
+Para Santander se usa directamente `datos_santander_limpios` en ambos roles.
+```{r aplicar_limpieza, echo=TRUE, message=FALSE, warning=FALSE}
+# Aplicar la limpieza de la precipitación a cada conjunto de datos
+datos_tama_limpios <- limpiar_precipitacion(datos_tama)
+datos_santander_limpios <- limpiar_precipitacion(datos_santander)
+
+# Mantener los valores NA para los análisis de continuidad (p. ej., rachas de sequía)
+datos_tama_con_NA <- datos_tama_limpios
+
+# Eliminar los valores NA para los análisis basados en precipitaciones observadas
+datos_tama_sin_NA <- datos_tama_limpios %>% filter(!is.na(prec))
+```
+
+## Bloque de control de calidad inicial
+El bloque de control de calidad tabula los años de cada estación con **menos de 330 días con dato** (umbral equivalente al ~90.4% de cobertura anual), documentando explícitamente qué años podrían verse excluidos de los análisis estadísticos de tendencia en secciones posteriores.
+```{r control_calidad_datos1, echo=TRUE, message=FALSE, warning=FALSE}
+# Identificar años con menos de 330 días con datos en cada estación
+datos_santander_limpios %>%
+  group_by(anio) %>%
+  summarise(dias_con_dato = n(), .groups = "drop") %>%
+  filter(dias_con_dato < 330) %>%
+  knitr::kable(
+    col.names = c("Año", "Nº de días con datos"),
+    caption = "Años con menos de 330 observaciones en Santander."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+
+datos_tama_sin_NA %>%
+  group_by(anio) %>%
+  summarise(dias_con_dato = n(), .groups = "drop") %>%
+  filter(dias_con_dato < 330) %>%
+  knitr::kable(
+    col.names = c("Año", "Nº de días con datos"),
+    caption = "Años con menos de 330 observaciones en Tama."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+# Sección 2 - Imputación de valores faltantes (NA)
+## 2.1 - Detección de bloques de datos faltantes
+`detectar_bloques_na()` es una herramienta auxiliar de diagnóstico que no forma parte del pipeline analítico principal. Usa `rle()` para identificar bloques consecutivos de NA en una variable (por defecto `prec`), asignando a cada fila un identificador de bloque (`bloque_id`) y la longitud de ese bloque (`bloque_longitud`). Se aplica al dataset de Tama con NA para caracterizar los datos faltantes antes de decidir la estrategia de imputación.
+```{r diagnostico_bloques_na, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para identificar bloques consecutivos de valores NA en una variable
+detectar_bloques_na <- function(df, variable = "prec") {
+  
+  # Identificar bloques consecutivos de valores NA
+  es_na <- is.na(df[[variable]])
+  rle_na <- rle(es_na)
+  
+  # Asignar un identificador y su longitud a cada bloque
+  bloque_id <- rep(seq_along(rle_na$lengths), times = rle_na$lengths)
+  bloque_longitud <- rep(rle_na$lengths, times = rle_na$lengths)
+  
+  # Incorporar la información al conjunto de datos
+  df$es_na <- es_na
+  df$bloque_id <- bloque_id
+  df$bloque_longitud <- bloque_longitud
+  
+  return(df)
+}
+
+# Identificar los bloques de valores NA en la serie de precipitación de Tama
+bloques_NA_tama <- detectar_bloques_na(datos_tama_con_NA)
+```
+
+La primera tabla resultante lista todos los bloques individuales de NA ordenados de mayor a menor duración, mostrando fecha de inicio y fin de cada uno. La segunda tabla resume cuántos bloques hay de cada longitud, lo que permite evaluar si los NA son predominantemente aislados (susceptibles de imputación) o forman bloques extensos que deben tratarse como irrecuperables.
+```{r}
+# Resumir los bloques de valores NA identificados en la serie de Tama
+bloques_NA_tama %>%
+  filter(es_na) %>% 
+  group_by(bloque_id) %>% 
+  summarise(
+    inicio = sprintf("%02d-%02d-%04d",
+                     min(dia[which.min(anio + mes/12 + dia/365)]),
+                     min(mes[which.min(anio + mes/12 + dia/365)]),
+                     min(anio[which.min(anio + mes/12 + dia/365)])),
+    fin = sprintf("%02d-%02d-%04d",
+                  max(dia[which.max(anio + mes/12 + dia/365)]),
+                  max(mes[which.max(anio + mes/12 + dia/365)]),
+                  max(anio[which.max(anio + mes/12 + dia/365)])),
+    longitud = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(longitud)) %>%
+  knitr::kable(
+    col.names = c("Bloque ID", "Inicio", "Fin", "Longitud (días)"),
+    caption = "Bloques de datos faltantes (NA) detectados en la estación Tama."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+
+# Resumir el número de bloques de valores NA según su longitud
+bloques_NA_tama %>%
+  filter(es_na) %>% 
+  group_by(bloque_longitud) %>% 
+  summarise(num_bloques = n_distinct(bloque_id), .groups = "drop") %>%
+  arrange(desc(bloque_longitud)) %>%
+  knitr::kable(
+    col.names = c("Longitud del bloque (días)", "Número de bloques"),
+    digits = c(0, 0),
+    caption = "Número de bloques de datos faltantes (NA) según su longitud en la estación Tama."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+## 2.2 - Cálculo de probabilidades de transición _seco_/_lluvia_
+`probabilidades_transicion()` es el Paso 1 del método de imputación mediante cadenas de Markov. Clasifica cada día con dato como _seco_ (prec <= umbral, por defecto 0.1 mm) o _lluvia_, y construye una tripleta de estados (estado del día anterior, estado actual, estado del día siguiente) verificando que las fechas sean realmente consecutivas en el calendario para evitar que los saltos entre años contaminen las probabilidades. Calcula la probabilidad empírica condicional `P(estado_actual | estado_previo, estado_siguiente, mes)` para cada mes del año. Se calcula únicamente sobre el **periodo histórico hasta 1995** (`hasta_anio` = 1995) para evitar usar datos recientes posiblemente afectados por el cambio climático como referencia de imputación. La tabla de probabilidades resultante (`probs_tama`) se presenta formateada con `kableExtra` para facilitar su inspección y documentar las distribuciones empíricas usadas en la imputación.
+```{r probabilidades_transicion_mejorada, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para calcular probabilidades de transición entre estados seco/lluvia
+# considerando el estado del día anterior y posterior.
+probabilidades_transicion <- function(df, umbral = 0.1, hasta_anio = NULL) {
+  
+  df <- df %>% arrange(anio, mes, dia)
+  
+  if (!is.null(hasta_anio)) df <- df %>% filter(anio <= hasta_anio)
+  
+  df <- df %>%
+    filter(!is.na(prec)) %>%
+    mutate(estado = ifelse(prec <= umbral, "seco", "lluvia"))
+  
+  # Añadir el estado de los días consecutivos anterior y posterior
+  df <- df %>%
+    mutate(
+      estado_prev = lag(estado),
+      estado_next = lead(estado),
+      consec_prev = (lag(anio) == anio & lag(mes) == mes & lag(dia) == dia - 1) |
+                   (lag(mes) == mes - 1 & dia == 1) |
+                   (lag(anio) == anio - 1 & lag(mes) == 12 & mes == 1 & dia == 1),
+      consec_next = (lead(anio) == anio & lead(mes) == mes & lead(dia) == dia + 1) |
+                   (lead(mes) == mes + 1 & lead(dia) == 1) |
+                   (lead(anio) == anio + 1 & lead(mes) == 1 & mes == 12 & dia == 31)
+    ) %>%
+    mutate(
+      estado_prev = ifelse(consec_prev, estado_prev, NA),
+      estado_next = ifelse(consec_next, estado_next, NA)
+    ) %>%
+    filter(!is.na(estado_prev) & !is.na(estado_next))
+  
+  # Calcular probabilidades de transición por mes
+  probs <- df %>%
+    group_by(mes, estado_prev, estado_next, estado) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(mes, estado_prev, estado_next) %>%
+    mutate(prob = n / sum(n)) %>%
+    ungroup() %>%
+    rename(estado_actual = estado)
+  
+  return(probs)
+}
+```
+
+```{r}
+# Calcular y mostrar probabilidades de transición seco/lluvia para Tama hasta 1995
+probs_tama <- probabilidades_transicion(datos_tama_con_NA, hasta_anio = 1995)
+
+probs_tama %>%
+  select(mes, estado_prev, estado_actual, estado_next, n, prob) %>%
+  mutate(prob = scales::percent(prob, accuracy = 0.1)) %>%
+  arrange(mes, estado_prev, estado_actual, estado_next) %>%
+  knitr::kable(
+    col.names = c("Mes", "Estado previo", "Estado actual", "Estado siguiente", "N", "Probabilidad"),
+    caption = "Probabilidades de transición entre estados seco/lluvia para la estación Tama hasta 1995."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+`imputar_con_transicion()` es el Paso 2 del método de imputación. A partir de `probs_tama` imputa el estado (_seco_/_lluvia_) de los días con NA en **bloques cortos de 1 o 2 días**.
+
+- Para bloques de 1 día solo imputa si ambos vecinos son consecutivos en el calendario y tienen estado conocido, consultando `P(seco | estado_prev, estado_next, mes)` y asignando el estado que supere el umbral_confianza = 0.70.
+- Para bloques de 2 días evalúa las cuatro combinaciones posibles ( _seco_ - _seco_, _seco_ - _lluvia_, _lluvia_ - _seco_, _lluvia_ - _lluvia_), calcula la probabilidad conjunta de cada una como producto `P(d1|prev,d2) × P(d2|d1,next)`, normaliza y asigna la combinación más probable si supera el umbral.
+
+En ambos casos verifica la consecutividad calendaria de los vecinos exteriores antes de imputar. El resultado (`estado_imputado_tama`) es el vector de estados con los NA imputables resueltos y los restantes conservados como NA.
+```{r imputacion_na_con_transicion_mejorada, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para imputar bloques cortos de valores NA mediante probabilidades de transición
+# entre estados seco/lluvia, utilizando el contexto de los días consecutivos.
+imputar_con_transicion <- function(df, probs, umbral = 0.1, max_na = 2, umbral_confianza = 0.7) {
+  
+  df <- df %>% arrange(anio, mes, dia)
+  
+  # Clasificar estados iniciales de precipitación
+  df$estado <- ifelse(df$prec <= umbral, "seco", 
+                      ifelse(is.na(df$prec), NA, "lluvia"))
+  
+  # Identificar bloques consecutivos de valores NA
+  es_na     <- is.na(df$estado)
+  rle_na    <- rle(es_na)
+  bloque_id <- rep(seq_along(rle_na$lengths), rle_na$lengths)
+  
+  long_bloques    <- tapply(es_na, bloque_id, length)
+  df$bloque_id    <- bloque_id
+  df$es_na        <- es_na
+  df$long_na      <- long_bloques[as.character(bloque_id)]
+  df$na_ignorable <- df$es_na & df$long_na <= max_na
+  
+  secuencia <- df$estado
+  bloques_imputables <- unique(df$bloque_id[df$na_ignorable])
+  
+  for (bid in bloques_imputables) {
+    
+    indices         <- which(df$bloque_id == bid)
+    longitud_bloque <- length(indices)
+    mes_bloque      <- df$mes[indices[1]]
+    
+    idx_prev <- indices[1] - 1
+    idx_next <- indices[longitud_bloque] + 1
+    
+    # Comprobar que los días anterior y posterior son consecutivos
+    if (idx_prev >= 1) {
+      es_consec_prev <- (df$anio[idx_prev] == df$anio[indices[1]] & 
+                         df$mes[idx_prev]  == df$mes[indices[1]]  & 
+                         df$dia[idx_prev]  == df$dia[indices[1]] - 1) |
+                        (df$mes[idx_prev]  == df$mes[indices[1]] - 1 & 
+                         df$dia[indices[1]] == 1) |
+                        (df$anio[idx_prev] == df$anio[indices[1]] - 1 & 
+                         df$mes[idx_prev]  == 12 & 
+                         df$mes[indices[1]] == 1  & 
+                         df$dia[indices[1]] == 1)
+      estado_prev <- if (es_consec_prev) secuencia[idx_prev] else NA
+    } else {
+      estado_prev <- NA
+    }
+    
+    if (idx_next <= nrow(df)) {
+      es_consec_next <- (df$anio[idx_next] == df$anio[indices[longitud_bloque]] & 
+                         df$mes[idx_next]  == df$mes[indices[longitud_bloque]]  & 
+                         df$dia[idx_next]  == df$dia[indices[longitud_bloque]] + 1) |
+                        (df$mes[idx_next]  == df$mes[indices[longitud_bloque]] + 1 & 
+                         df$dia[idx_next]  == 1) |
+                        (df$anio[idx_next] == df$anio[indices[longitud_bloque]] + 1 & 
+                         df$mes[idx_next]  == 1  & 
+                         df$mes[indices[longitud_bloque]] == 12 & 
+                         df$dia[indices[longitud_bloque]] == 31)
+      estado_next <- if (es_consec_next) secuencia[idx_next] else NA
+    } else {
+      estado_next <- NA
+    }
+    
+    if (longitud_bloque == 1) {
+      
+      # Imputar un único NA cuando la probabilidad supera el umbral de confianza
+      if (!is.na(estado_prev) & !is.na(estado_next)) {
+        
+        p_seco <- probs %>%
+          filter(mes == mes_bloque, estado_prev == !!estado_prev, estado_next == !!estado_next,
+                 estado_actual == "seco") %>%
+          pull(prob)
+        p_seco <- if (length(p_seco) == 0) 0.5 else p_seco
+        
+        if (p_seco >= umbral_confianza) {
+          secuencia[indices[1]] <- "seco"
+        } else if ((1 - p_seco) >= umbral_confianza) {
+          secuencia[indices[1]] <- "lluvia"
+        }
+      }
+      
+    } else if (longitud_bloque == 2) {
+      
+      # Imputar bloques de dos días mediante la combinación más probable
+      if (!is.na(estado_prev) & !is.na(estado_next)) {
+        
+        combinaciones <- expand.grid(d1 = c("seco", "lluvia"), d2 = c("seco", "lluvia"),
+                                     stringsAsFactors = FALSE)
+        
+        combinaciones$prob_conjunta <- mapply(function(d1, d2) {
+          
+          p1 <- probs %>%
+            filter(mes == mes_bloque, estado_prev == !!estado_prev, estado_next == d2, estado_actual == d1) %>%
+            pull(prob)
+          p1 <- if (length(p1) == 0) 0.5 else p1
+          
+          p2 <- probs %>%
+            filter(mes == mes_bloque, estado_prev == d1, estado_next == !!estado_next, estado_actual == d2) %>%
+            pull(prob)
+          p2 <- if (length(p2) == 0) 0.5 else p2
+          
+          p1 * p2
+          
+        }, combinaciones$d1, combinaciones$d2)
+        
+        combinaciones$prob_conjunta <- combinaciones$prob_conjunta /
+                                       sum(combinaciones$prob_conjunta)
+        
+        mejor <- combinaciones[which.max(combinaciones$prob_conjunta), ]
+        
+        if (mejor$prob_conjunta >= umbral_confianza) {
+          secuencia[indices[1]] <- mejor$d1
+          secuencia[indices[2]] <- mejor$d2
+        }
+      }
+    }
+  }
+  
+  return(secuencia)
+}
+
+estado_imputado_tama <- imputar_con_transicion(datos_tama_con_NA, probs = probs_tama)
+```
+
+## 2.3 - Trazabilidad de la imputación
+A continuación, documentamos el resultado de la imputación en dos tablas de trazabilidad:
+
+- La primera muestra todos los días individuales con dato faltante que fueron imputados, con su fecha, el estado del día anterior y posterior, el estado asignado y la probabilidad de imputación expresada como porcentaje. Solo se muestran los casos con probabilidad superior al umbral del 70%.
+- La segunda tabla detalla el bloque de dos días imputados conjuntamente, mostrando las probabilidades individuales de cada día y la probabilidad conjunta de la combinación seleccionada frente al resto de combinaciones posibles. Esta documentación permite verificar que la imputación es metodológicamente sólida y no introduce sesgos en el análisis posterior.
+```{r}
+# Mostrar los días imputados y la probabilidad asociada mediante transición seco/lluvia
+
+estado_original <- ifelse(datos_tama_con_NA$prec <= 0.1, "seco",
+                          ifelse(is.na(datos_tama_con_NA$prec), NA, "lluvia"))
+
+datos_tama_con_NA %>%
+  mutate(estado_original = estado_original, estado_imputado = estado_imputado_tama) %>%
+  filter(is.na(estado_original) & !is.na(estado_imputado)) %>%
+  mutate(
+    idx = match(paste(anio, mes, dia),
+                paste(datos_tama_con_NA$anio, datos_tama_con_NA$mes, datos_tama_con_NA$dia)),
+    estado_prev = estado_imputado_tama[idx - 1],
+    estado_next = estado_imputado_tama[idx + 1]
+  ) %>%
+  left_join(
+    probs_tama,
+    by = c("mes", "estado_prev", "estado_next", "estado_imputado" = "estado_actual")
+  ) %>%
+  mutate(
+    fecha = sprintf("%02d-%02d-%04d", dia, mes, anio),
+    prob_imputacion = scales::percent(prob, accuracy = 0.1)
+  ) %>%
+  select(fecha, estado_prev, estado_imputado, estado_next, prob_imputacion) %>%
+  knitr::kable(
+    col.names = c("Fecha", "Estado día anterior", "Estado imputado", "Estado día siguiente", "Probabilidad de imputación"),
+    caption = "Días con dato faltante imputados mediante probabilidades de transición en Tama. Solo se muestran casos con probabilidad superior al 70%."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+```{r}
+# Calcular la probabilidad conjunta de un bloque de dos días imputados mediante transición seco/lluvia
+
+dias_imputados <- datos_tama_con_NA %>%
+  mutate(estado_original = estado_original, estado_imputado = estado_imputado_tama) %>%
+  filter(is.na(estado_original) & !is.na(estado_imputado)) %>%
+  mutate(
+    idx = match(paste(anio, mes, dia),
+                paste(datos_tama_con_NA$anio, datos_tama_con_NA$mes, datos_tama_con_NA$dia)),
+    estado_prev = estado_imputado_tama[idx - 1],
+    estado_next = estado_imputado_tama[idx + 1]
+  )
+
+# Obtener probabilidades individuales de cada día imputado
+dias_con_prob_ind <- dias_imputados %>%
+  left_join(probs_tama,
+            by = c("mes", "estado_prev", "estado_next", "estado_imputado" = "estado_actual")) %>%
+  mutate(fecha = sprintf("%02d-%02d-%04d", dia, mes, anio))
+
+# Generar combinaciones posibles de estados para el bloque
+combinaciones <- expand.grid(d1 = c("seco", "lluvia"), d2 = c("seco", "lluvia"), stringsAsFactors = FALSE)
+
+# Obtener estados exteriores del bloque y mes de referencia
+estado_ext_prev <- dias_imputados$estado_prev[1]
+estado_ext_next <- dias_imputados$estado_next[2]
+mes_bloque <- dias_imputados$mes[1]
+
+combinaciones$prob_conjunta <- mapply(function(d1, d2) {
+  p1 <- probs_tama %>%
+    filter(mes == mes_bloque, estado_prev == estado_ext_prev,
+           estado_next == d2, estado_actual == d1) %>%
+    pull(prob)
+  p1 <- if (length(p1) == 0) 0.5 else p1
+  
+  p2 <- probs_tama %>%
+    filter(mes == mes_bloque, estado_prev == d1,
+           estado_next == estado_ext_next, estado_actual == d2) %>%
+    pull(prob)
+  p2 <- if (length(p2) == 0) 0.5 else p2
+  
+  p1 * p2
+}, combinaciones$d1, combinaciones$d2)
+
+# Normalizar probabilidades conjuntas
+combinaciones$prob_conjunta <- combinaciones$prob_conjunta / sum(combinaciones$prob_conjunta)
+
+# Seleccionar la combinación de estados finalmente imputada
+combinacion_imputada <- combinaciones %>%
+  filter(d1 == dias_imputados$estado_imputado[1], d2 == dias_imputados$estado_imputado[2])
+
+tibble(
+  Fecha_dia1 = sprintf("%02d-%02d-%04d", dias_imputados$dia[1], dias_imputados$mes[1], dias_imputados$anio[1]),
+  Fecha_dia2 = sprintf("%02d-%02d-%04d", dias_imputados$dia[2], dias_imputados$mes[2], dias_imputados$anio[2]),
+  Estado_imputado_d1 = dias_imputados$estado_imputado[1],
+  Estado_imputado_d2 = dias_imputados$estado_imputado[2],
+  Prob_ind_d1 = scales::percent(dias_con_prob_ind$prob[1], accuracy = 0.1),
+  Prob_ind_d2 = scales::percent(dias_con_prob_ind$prob[2], accuracy = 0.1),
+  Prob_conjunta = scales::percent(combinacion_imputada$prob_conjunta, accuracy = 0.1)
+) %>%
+  knitr::kable(
+    col.names = c("Fecha día 1", "Fecha día 2", "Estado imputado día 1", "Estado imputado día 2",
+                  "Prob. individual día 1", "Prob. individual día 2", "Prob. conjunta del bloque"),
+    caption = "Bloque de dos días imputados mediante probabilidades de transición en Tama. La probabilidad conjunta representa la combinación seleccionada frente al resto de combinaciones posibles."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE, position = "center"
+  )
+```
+
+# Sección 3 - Episodios extremos y persistencia de la lluvia
+## 3.1 - Días de precipitación extrema
+`calcular_extremos_prec()` identifica los días de precipitación extrema usando el percentil 95 de la serie válida como umbral (coherente con la definición empleada en el análisis de extremos térmicos). Devuelve una lista con el dataframe enriquecido con la columna lógica `extremo` y un resumen anual con el número de días extremos (dias_extremos) y la precipitación máxima registrada ese año (max_prec). Se aplica a los datasets sin NA de cada estación.
+```{r calculo_extremos_prec, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para identificar días de precipitación extrema mediante un umbral percentil
+# y generar un resumen anual de frecuencia y valores máximos.
+calcular_extremos_prec <- function(df, percentil = 0.95) {
+  
+  # Calcular el umbral de precipitación extrema
+  umbral_extremo <- quantile(df$prec, probs = percentil, na.rm = TRUE)
+  
+  # Clasificar días extremos
+  df$extremo <- df$prec >= umbral_extremo
+  
+  # Resumen anual
+  resumen_anual <- df %>%
+    group_by(anio) %>%
+    summarise(
+      dias_extremos = sum(extremo, na.rm = TRUE),
+      max_prec = max(prec, na.rm = TRUE)
+    )
+  
+  return(list(datos = df, resumen_anual = resumen_anual))
+}
+
+# Aplicar el cálculo de extremos de precipitación a cada estación
+# utilizando los datasets preparados según el tratamiento de valores NA
+lluviaExtrema_tama <- calcular_extremos_prec(datos_tama_sin_NA)
+lluviaExtrema_santander <- calcular_extremos_prec(datos_santander_limpios)
+```
+
+`plot_extremos_anuales()` genera un gráfico de barras con degradado de color azul proporcional al número de días extremos (`scale_fill_gradient`) y una curva LOESS roja discontinua que muestra la tendencia general. El panel vertical _Tama / Santander_ permite comparar visualmente si los días de lluvia extrema presentan alguna tendencia temporal.
+```{r grafica_extremos, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=10, fig.align="center"}
+# Función para graficar la evolución anual de días con precipitación extrema y su tendencia
+plot_extremos_anuales <- function(df_anual, estacion) {
+  
+  ggplot(df_anual, aes(x = anio, y = dias_extremos)) +
+    
+    geom_col(aes(fill = dias_extremos), alpha = 0.8) +
+    scale_fill_gradient(name = "Días extremos", low = "lightblue", high = "darkblue") +
+    
+    geom_smooth(method = "loess", se = FALSE, color = "red", linetype = "dashed") +
+    
+    labs(title = paste(estacion), x = "Año", y = "Nº de días") +
+    
+    theme_minimal()
+}
+
+# Generar y comparar las gráficas de días de precipitación extrema por año para cada estación
+extremos_tama <- plot_extremos_anuales(lluviaExtrema_tama$resumen_anual, "Tama")
+extremos_santander <- plot_extremos_anuales(lluviaExtrema_santander$resumen_anual, "Santander")
+
+extremos_tama / extremos_santander
+```
+
+## 3.2 - Rachas de sequía y lluvia
+
+`calcular_rachas()` detecta y caracteriza las rachas consecutivas de un estado meteorológico (_seco_ o _lluvia_) a partir del vector de estados imputados (`estado_input`) o calculándolos directamente desde `prec` si no se proporciona. Usa `rle()` para identificar los bloques y genera un resumen con _duración_, _año_, _mes_ y _día_ de inicio y fin de cada racha.
+
+Se aplica a ambas estaciones: Tama usa `estado_imputado_tama` (con los NA de 1-2 días ya resueltos), mientras que Santander lo calcula directamente desde `prec` dado que sus NA son escasos. Se calculan rachas tanto secas como lluviosas en el mismo paso para evitar repetir el procesamiento.
+```{r}
+# Función para identificar y resumir rachas consecutivas de estados seco/lluvia
+# a partir de la precipitación o de una clasificación de estados proporcionada.
+calcular_rachas <- function(df, umbral = 0.1, tipo, estado_input = NULL) {
+  
+  df <- df %>% arrange(anio, mes, dia)
+  
+  # Usar estados proporcionados o calcularlos a partir de la precipitación
+  if (!is.null(estado_input)) {
+    df$estado <- estado_input
+  } else {
+    df$estado <- ifelse(df$prec <= umbral, "seco",
+                        ifelse(is.na(df$prec), NA, "lluvia"))
+  }
+  
+  # Identificar bloques consecutivos de cada estado
+  rle_seq <- rle(df$estado)
+  
+  rachas <- data.frame(longitud = rle_seq$lengths, valor = rle_seq$values)
+  
+  rachas$tipo_racha <- rachas$valor
+  rachas$grupo <- seq_along(rachas$longitud)
+  
+  df$grupo_racha <- rep(rachas$grupo, rle_seq$lengths)
+  df$tipo_racha <- rep(rachas$tipo_racha, rle_seq$lengths)
+  
+  # Resumir duración y fechas de inicio y fin de cada racha
+  resumen <- df %>%
+    group_by(grupo_racha, tipo_racha) %>%
+    summarise(
+      duracion = n(),
+      inicio_anio = min(anio),
+      inicio_mes = min(mes),
+      inicio_dia = min(dia),
+      fin_anio = max(anio),
+      fin_mes = max(mes),
+      fin_dia = max(dia),
+      .groups = "drop"
+    ) %>%
+    filter(tipo_racha == tipo)
+  
+  return(list(datos = df, rachas = resumen))
+}
+
+# Calcular rachas secas para cada estación usando los estados disponibles
+rachas_secas_tama <- calcular_rachas(datos_tama_con_NA, tipo = "seco", estado_input = estado_imputado_tama)
+rachas_secas_santander <- calcular_rachas(datos_santander_limpios, tipo = "seco")
+
+# Calcular rachas de lluvia e identificar eventos según duración mínima
+rachas_lluviosas_tama <- calcular_rachas(datos_tama_con_NA, tipo = "lluvia", estado_input = estado_imputado_tama)
+rachas_lluviosas_santander <- calcular_rachas(datos_santander_limpios, tipo = "lluvia")
+```
+
+### 3.2.1 - Filtrado de rachas por duración mínima y funciones gráficas
+A continuación se filtran tres subconjuntos por duración mínima (3, 7 y 15 días) tanto para sequías como para lluvias, eliminando episodios muy cortos que podrían ser ruido o errores de medición sin significado meteorológico.
+```{r rachas_sequia_filtradas, echo=TRUE, message=FALSE, warning=FALSE}
+# Filtrar rachas secas según diferentes duraciones mínimas
+rachas_secas_tama_3dias <- rachas_secas_tama$rachas %>% filter(duracion >= 3)
+rachas_secas_santander_3dias <- rachas_secas_santander$rachas %>% filter(duracion >= 3)
+
+rachas_secas_tama_7dias <- rachas_secas_tama$rachas %>% filter(duracion >= 7)
+rachas_secas_santander_7dias <- rachas_secas_santander$rachas %>% filter(duracion >= 7)
+
+rachas_secas_tama_15dias <- rachas_secas_tama$rachas %>% filter(duracion >= 15)
+rachas_secas_santander_15dias <- rachas_secas_santander$rachas %>% filter(duracion >= 15)
+```
+
+Definimos las dos funciones gráficas de propósito general que se reutilizan en todos los indicadores de rachas:
+
+- `graficar_serie_anual()` crea un gráfico de línea para variables continuas (racha máxima anual, duración media), con una curva LOESS discontinua como tendencia suavizada.
+- `graficar_histograma_anual()` crea barras (`geom_col`) para variables de conteo o porcentaje (número de rachas, porcentaje del año), añadiendo igualmente la curva LOESS. Ambas reciben parámetros de color separados para la serie y la tendencia, y el eje x es siempre inicio_anio.
+```{r funcion_graficas, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para representar series temporales anuales con tendencia suavizada
+graficar_serie_anual <- function(df, variable, titulo = "", ylab = "", color_punto = NULL, color_linea, color_tendencia = "black") {
+  
+  ggplot(df, aes(x = inicio_anio, y = .data[[variable]])) +
+    geom_line(color = color_linea, linewidth = 0.5) +
+    geom_smooth(method = "loess", se = FALSE, color = color_tendencia, linetype = "dashed") +
+    labs(title = titulo, x = "Año", y = ylab) +
+    theme_minimal()
+}
+
+# Función para representar variables anuales mediante barras y tendencia suavizada
+graficar_histograma_anual <- function(df, variable, titulo = "", ylab = "", color_fill, color_linea) {
+  
+  ggplot(df, aes(x = inicio_anio, y = .data[[variable]])) +
+    geom_col(fill = color_fill, alpha = 0.7) +
+    geom_smooth(method = "loess", se = FALSE, color = color_linea, linetype = "dashed") +
+    labs(title = titulo, x = "Año", y = ylab) +
+    theme_minimal()
+}
+```
+
+Se definen también las cuatro funciones de agregación anual: 
+
+- `racha_max()` devuelve la duración máxima de racha por año
+- `num_rachas()` cuenta el número de rachas
+- `duracion_media()` calcula la media de duraciones
+- `porcentaje_tiempo_total_racha()` suma las duraciones y las expresa como porcentaje de 365 días.
+```{r}
+# Función para calcular la duración máxima anual de las rachas secas
+racha_max <- function(rachas_df) {
+  
+  rachas_df %>%
+    group_by(inicio_anio) %>%
+    summarise(racha_max = max(duracion, na.rm = TRUE), .groups = "drop")
+}
+
+# Función para calcular el número anual de rachas secas
+num_rachas <- function(rachas_df) {
+  
+  rachas_df %>%
+    group_by(inicio_anio) %>%
+    summarise(num_rachas = n(), .groups = "drop")
+}
+
+# Función para calcular la duración media anual de las rachas secas
+duracion_media <- function(rachas_df) {
+  
+  rachas_df %>%
+    group_by(inicio_anio) %>%
+    summarise(duracion_media = mean(duracion, na.rm = TRUE), .groups = "drop")
+}
+
+# Función para calcular el tiempo anual ocupado por rachas secas
+porcentaje_tiempo_total_racha <- function(rachas_df) {
+  
+  rachas_df %>%
+    group_by(inicio_anio) %>%
+    summarise(
+      tiempo_total = sum(duracion, na.rm = TRUE),
+      porcentaje_anual = (tiempo_total / 365) * 100,
+      .groups = "drop"
+    )
+}
+```
+
+### 3.2.2 - Rachas de sequía
+#### Racha máxima anual de sequía por año
+Calculamos la racha seca máxima anual para cada estación usando `racha_max()` sobre el conjunto completo de rachas (sin filtro de duración mínima), para capturar también los eventos más extremos. Los gráficos de ambas estaciones comparten el mismo rango temporal en el eje x (`scale_x_continuous` con `limites_anios` calculados como el mínimo y máximo global) para que la comparación visual sea directa.
+```{r racha_maxima, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular la racha seca máxima anual para cada estación
+racha_max_anual_sequia_tama <- racha_max(rachas_secas_tama$rachas)
+racha_max_anual_sequia_santander <- racha_max(rachas_secas_santander$rachas)
+```
+
+```{r graficas_racha_max, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=6, fig.align="center"}
+# Graficar la evolución anual de la racha seca máxima para cada estación
+limites_anios <- c(min(racha_max_anual_sequia_tama$inicio_anio, racha_max_anual_sequia_santander$inicio_anio),
+                  max(racha_max_anual_sequia_tama$inicio_anio, racha_max_anual_sequia_santander$inicio_anio))
+
+plot_sequia_max_tama <- graficar_serie_anual(
+  racha_max_anual_sequia_tama,
+  variable = "racha_max",
+  titulo = "Tama",
+  ylab = "Nº de días",
+  color_linea = "darkred"
+) + scale_x_continuous(limits = limites_anios)
+
+plot_sequia_max_santander <- graficar_serie_anual(
+  racha_max_anual_sequia_santander,
+  variable = "racha_max",
+  titulo = "Santander",
+  ylab = "Nº de días",
+  color_linea = "darkred"
+) + scale_x_continuous(limits = limites_anios)
+
+plot_sequia_max_tama / plot_sequia_max_santander
+```
+
+#### Número de rachas de sequía por año
+Calculamos el número anual de rachas secas para cada estación y cada uno de los tres filtros de duración mínima (3, 7 y 15 días). El panel 3×2 resultante (filas = filtro de duración, columnas = estación) permite evaluar si una posible tendencia en el número de episodios secos es robusta frente al umbral de duración mínima elegido, o si depende de incluir o excluir los episodios muy cortos.
+```{r numero_rachas, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular el número de rachas secas según duración mínima
+num_rachas_sequia_tama_3dias <- num_rachas(rachas_secas_tama_3dias)
+num_rachas_sequia_santander_3dias <- num_rachas(rachas_secas_santander_3dias)
+num_rachas_sequia_tama_7dias <- num_rachas(rachas_secas_tama_7dias)
+num_rachas_sequia_santander_7dias <- num_rachas(rachas_secas_santander_7dias)
+num_rachas_sequia_tama_15dias <- num_rachas(rachas_secas_tama_15dias)
+num_rachas_sequia_santander_15dias <- num_rachas(rachas_secas_santander_15dias)
+```
+
+```{r graficas_num_rachas, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=6, fig.align="center"}
+# Graficar el número anual de rachas secas según duración mínima y estación
+color_racha <- "coral1"
+color_tendencia <- "darkred"
+
+num_sequia_tama_3dias <- graficar_histograma_anual(num_rachas_sequia_tama_3dias, "num_rachas", "Tama - Sequías >= 3 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_sequia_tama_7dias <- graficar_histograma_anual(num_rachas_sequia_tama_7dias, "num_rachas", "Tama - Sequías >= 7 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_sequia_tama_15dias <- graficar_histograma_anual(num_rachas_sequia_tama_15dias, "num_rachas", "Tama - Sequías >= 15 días", "Nº de \nrachas", color_racha, color_tendencia)
+
+num_sequia_santander_3dias <- graficar_histograma_anual(num_rachas_sequia_santander_3dias, "num_rachas", "Santander - Sequías >= 3 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_sequia_santander_7dias <- graficar_histograma_anual(num_rachas_sequia_santander_7dias, "num_rachas", "Santander - Sequías >= 7 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_sequia_santander_15dias <- graficar_histograma_anual(num_rachas_sequia_santander_15dias, "num_rachas", "Santander - Sequías >= 15 días", "Nº de \nrachas", color_racha, color_tendencia)
+
+(num_sequia_tama_3dias | num_sequia_santander_3dias) /
+(num_sequia_tama_7dias | num_sequia_santander_7dias) /
+(num_sequia_tama_15dias | num_sequia_santander_15dias) +
+  plot_annotation(title = "Número de rachas de sequía por año con diferentes filtros de duración")
+```
+
+#### Duración media de rachas de sequía por año
+Calculamos la duración media anual de las rachas secas para cada estación y filtro de duración mínima. La visualización en panel 3×2 con escala de color permite comparar si la persistencia media de los episodios de sequía ha cambiado a lo largo del tiempo, de forma robusta frente al umbral elegido.
+```{r duracion_media, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular la duración media de rachas secas según duración mínima
+duracion_media_sequia_tama_3dias <- duracion_media(rachas_secas_tama_3dias)
+duracion_media_sequia_santander_3dias <- duracion_media(rachas_secas_santander_3dias)
+duracion_media_sequia_tama_7dias <- duracion_media(rachas_secas_tama_7dias)
+duracion_media_sequia_santander_7dias <- duracion_media(rachas_secas_santander_7dias)
+duracion_media_sequia_tama_15dias <- duracion_media(rachas_secas_tama_15dias)
+duracion_media_sequia_santander_15dias <- duracion_media(rachas_secas_santander_15dias)
+```
+
+```{r graficas_duracion_media, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Graficar la duración media anual de las rachas secas según duración mínima y estación
+color_racha <- "coral"
+color_tendencia <- "coral3"
+
+duracion_media_tama_3dias <- graficar_serie_anual(duracion_media_sequia_tama_3dias, "duracion_media", "Tama - Sequías >= 3 días", "Nº de \ndías", color_racha, color_tendencia)
+duracion_media_tama_7dias <- graficar_serie_anual(duracion_media_sequia_tama_7dias, "duracion_media", "Tama - Sequías >= 7 días", "Nº de \ndías", color_racha, color_tendencia)
+duracion_media_tama_15dias <- graficar_serie_anual(duracion_media_sequia_tama_15dias, "duracion_media", "Tama - Sequías >= 15 días", "Nº de \ndías", color_racha, color_tendencia)
+
+duracion_media_santander_3dias <- graficar_serie_anual(duracion_media_sequia_santander_3dias, "duracion_media", "Santander - Sequías >= 3 días", "Nº de \ndías", color_racha, color_tendencia)
+duracion_media_santander_7dias <- graficar_serie_anual(duracion_media_sequia_santander_7dias, "duracion_media", "Santander - Sequías >= 7 días", "Nº de \ndías", color_racha, color_tendencia)
+duracion_media_santander_15dias <- graficar_serie_anual(duracion_media_sequia_santander_15dias, "duracion_media", "Santander - Sequías >= 15 días", "Nº de \ndías", color_racha, color_tendencia)
+
+(duracion_media_tama_3dias | duracion_media_santander_3dias) /
+(duracion_media_tama_7dias | duracion_media_santander_7dias) /
+(duracion_media_tama_15dias | duracion_media_santander_15dias) +
+  plot_annotation(title = "Duración media anual de rachas de sequía")
+```
+
+#### Porcentaje del tiempo total de sequía por año
+Calculamos el porcentaje del año ocupado por rachas secas (suma de duraciones / 365 × 100) para cada estación y filtro de duración mínima. El panel 3×2 con barras en rojo ocre responde a la pregunta de si las sequías están ocupando una fracción creciente del año, más allá de si hay más episodios o si estos son más largos individualmente.
+```{r porcentaje_tiempo_total, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular el porcentaje anual de tiempo en racha seca según duración mínima
+tiempo_total_sequia_tama_3dias <- porcentaje_tiempo_total_racha(rachas_secas_tama_3dias)
+tiempo_total_sequia_santander_3dias <- porcentaje_tiempo_total_racha(rachas_secas_santander_3dias)
+tiempo_total_sequia_tama_7dias <- porcentaje_tiempo_total_racha(rachas_secas_tama_7dias)
+tiempo_total_sequia_santander_7dias <- porcentaje_tiempo_total_racha(rachas_secas_santander_7dias)
+tiempo_total_sequia_tama_15dias <- porcentaje_tiempo_total_racha(rachas_secas_tama_15dias)
+tiempo_total_sequia_santander_15dias <- porcentaje_tiempo_total_racha(rachas_secas_santander_15dias)
+```
+
+```{r graficas_porcentaje_tiempo_total, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Graficar el porcentaje anual de tiempo en racha seca según duración mínima y estación
+color_racha <- "indianred3"
+color_tendencia <- "coral4"
+
+porcentaje_total_sequia_anual_tama_3dias <- graficar_histograma_anual(tiempo_total_sequia_tama_3dias, "porcentaje_anual", "Tama - Sequía >= 3 días", "%", color_racha, color_tendencia)
+porcentaje_total_sequia_anual_tama_7dias <- graficar_histograma_anual(tiempo_total_sequia_tama_7dias, "porcentaje_anual", "Tama - Sequía >= 7 días", "%", color_racha, color_tendencia)
+porcentaje_total_sequia_anual_tama_15dias <- graficar_histograma_anual(tiempo_total_sequia_tama_15dias, "porcentaje_anual", "Tama - Sequía >= 15 días", "%", color_racha, color_tendencia)
+
+porcentaje_total_sequia_anual_santander_3dias <- graficar_histograma_anual(tiempo_total_sequia_santander_3dias, "porcentaje_anual", "Santander - Sequía >= 3 días", "%", color_racha, color_tendencia)
+porcentaje_total_sequia_anual_santander_7dias <- graficar_histograma_anual(tiempo_total_sequia_santander_7dias, "porcentaje_anual", "Santander - Sequía >= 7 días", "%", color_racha, color_tendencia)
+porcentaje_total_sequia_anual_santander_15dias <- graficar_histograma_anual(tiempo_total_sequia_santander_15dias, "porcentaje_anual", "Santander - Sequía >= 15 días", "%", color_racha, color_tendencia)
+
+(porcentaje_total_sequia_anual_tama_3dias | porcentaje_total_sequia_anual_santander_3dias) /
+(porcentaje_total_sequia_anual_tama_7dias | porcentaje_total_sequia_anual_santander_7dias) /
+(porcentaje_total_sequia_anual_tama_15dias | porcentaje_total_sequia_anual_santander_15dias) +
+  plot_annotation(title = "Porcentaje anual de tiempo en sequía con diferentes filtros de duración")
+```
+
+### 3.2.3 - Rachas de lluvia
+Aplicamos los mismos cuatro indicadores anuales al análisis de rachas lluviosas, usando una paleta de azules para diferenciar visualmente este bloque del de sequías. Los filtros de duración mínima son idénticos (3, 7 y 15 días).
+```{r rachas_lluvia_filtradas, echo=TRUE, message=FALSE, warning=FALSE}
+# Filtrar rachas de lluvia según diferentes duraciones mínimas
+rachas_lluviosas_tama_3dias <- rachas_lluviosas_tama$rachas %>% filter(duracion >= 3)
+rachas_lluviosas_santander_3dias <- rachas_lluviosas_santander$rachas %>% filter(duracion >= 3)
+
+rachas_lluviosas_tama_7dias <- rachas_lluviosas_tama$rachas %>% filter(duracion >= 7)
+rachas_lluviosas_santander_7dias <- rachas_lluviosas_santander$rachas %>% filter(duracion >= 7)
+
+rachas_lluviosas_tama_15dias <- rachas_lluviosas_tama$rachas %>% filter(duracion >= 15)
+rachas_lluviosas_santander_15dias <- rachas_lluviosas_santander$rachas %>% filter(duracion >= 15)
+```
+
+#### Racha máxima anual de lluvias por año
+Para los gráficos de racha máxima se usa el mismo criterio de eje temporal compartido que en el análisis de sequía.
+```{r calculo_racha_max_lluvia, echo=TRUE, message=FALSE, warning=FALSE}
+# Racha máxima anual de lluvias por año
+racha_max_anual_lluvia_tama <- racha_max(rachas_lluviosas_tama$rachas)
+racha_max_anual_lluvia_santander <- racha_max(rachas_lluviosas_santander$rachas)
+```
+
+```{r graficas_racha_max_lluvia, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=6, fig.align="center"}
+# Graficar la evolución anual de la racha máxima de lluvia para cada estación
+limites_anios <- c(min(racha_max_anual_lluvia_tama$inicio_anio, racha_max_anual_lluvia_santander$inicio_anio),
+                  max(racha_max_anual_lluvia_tama$inicio_anio, racha_max_anual_lluvia_santander$inicio_anio))
+
+plot_lluvia_max_tama <- graficar_serie_anual(racha_max_anual_lluvia_tama, "racha_max", "Tama", "Nº de días", color_linea = "darkblue") +
+  scale_x_continuous(limits = limites_anios)
+
+plot_lluvia_max_santander <- graficar_serie_anual(racha_max_anual_lluvia_santander, "racha_max", "Santander", "Nº de días", color_linea = "darkblue") +
+  scale_x_continuous(limits = limites_anios)
+
+plot_lluvia_max_tama / plot_lluvia_max_santander
+```
+
+#### Número de rachas de lluvia por año
+```{r numero_rachas_lluvia, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular el número anual de rachas de lluvia según duración mínima
+num_rachas_lluvia_tama_3dias <- num_rachas(rachas_lluviosas_tama_3dias)
+num_rachas_lluvia_santander_3dias <- num_rachas(rachas_lluviosas_santander_3dias)
+num_rachas_lluvia_tama_7dias <- num_rachas(rachas_lluviosas_tama_7dias)
+num_rachas_lluvia_santander_7dias <- num_rachas(rachas_lluviosas_santander_7dias)
+num_rachas_lluvia_tama_15dias <- num_rachas(rachas_lluviosas_tama_15dias)
+num_rachas_lluvia_santander_15dias <- num_rachas(rachas_lluviosas_santander_15dias)
+```
+
+```{r graficas_num_rachas_lluvia, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=6, fig.align="center"}
+# Graficar el número anual de rachas de lluvia según duración mínima y estación
+color_racha <- "lightskyblue3"
+color_tendencia <- "darkblue"
+
+num_lluvia_tama_3dias <- graficar_histograma_anual(num_rachas_lluvia_tama_3dias, "num_rachas", "Tama - Lluvias >= 3 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_lluvia_tama_7dias <- graficar_histograma_anual(num_rachas_lluvia_tama_7dias, "num_rachas", "Tama - Lluvias >= 7 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_lluvia_tama_15dias <- graficar_histograma_anual(num_rachas_lluvia_tama_15dias, "num_rachas", "Tama - Lluvias >= 15 días", "Nº de \nrachas", color_racha, color_tendencia)
+
+num_lluvia_santander_3dias <- graficar_histograma_anual(num_rachas_lluvia_santander_3dias, "num_rachas", "Santander - Lluvias >= 3 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_lluvia_santander_7dias <- graficar_histograma_anual(num_rachas_lluvia_santander_7dias, "num_rachas", "Santander - Lluvias >= 7 días", "Nº de \nrachas", color_racha, color_tendencia)
+num_lluvia_santander_15dias <- graficar_histograma_anual(num_rachas_lluvia_santander_15dias, "num_rachas", "Santander - Lluvias >= 15 días", "Nº de \nrachas", color_racha, color_tendencia)
+
+(num_lluvia_tama_3dias | num_lluvia_santander_3dias) /
+(num_lluvia_tama_7dias | num_lluvia_santander_7dias) /
+(num_lluvia_tama_15dias | num_lluvia_santander_15dias) +
+  plot_annotation(title = "Número de rachas de lluvia por año con diferentes filtros de duración")
+```
+
+#### Duración media de rachas de lluvia por año
+```{r duracion_media_lluvia, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular la duración media anual de rachas de lluvia según duración mínima
+duracion_media_lluvia_tama_3dias <- duracion_media(rachas_lluviosas_tama_3dias)
+duracion_media_lluvia_santander_3dias <- duracion_media(rachas_lluviosas_santander_3dias)
+duracion_media_lluvia_tama_7dias <- duracion_media(rachas_lluviosas_tama_7dias)
+duracion_media_lluvia_santander_7dias <- duracion_media(rachas_lluviosas_santander_7dias)
+duracion_media_lluvia_tama_15dias <- duracion_media(rachas_lluviosas_tama_15dias)
+duracion_media_lluvia_santander_15dias <- duracion_media(rachas_lluviosas_santander_15dias)
+```
+
+```{r graficas_duracion_media_lluvia, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Graficar la duración media anual de rachas de lluvia según duración mínima y estación
+color_racha <- "#528B8B"
+color_tendencia <- "#2F4F4F"
+
+plot_duracion_media_lluvia_tama_3dias <- graficar_serie_anual(duracion_media_lluvia_tama_3dias, "duracion_media", "Tama - Lluvias >= 3 días", "Nº de\ndías", color_racha, color_tendencia)
+plot_duracion_media_lluvia_tama_7dias <- graficar_serie_anual(duracion_media_lluvia_tama_7dias, "duracion_media", "Tama - Lluvias >= 7 días", "Nº de\ndías", color_racha, color_tendencia)
+plot_duracion_media_lluvia_tama_15dias <- graficar_serie_anual(duracion_media_lluvia_tama_15dias, "duracion_media", "Tama - Lluvias >= 15 días", "Nº de\ndías", color_racha, color_tendencia)
+
+plot_duracion_media_lluvia_santander_3dias <- graficar_serie_anual(duracion_media_lluvia_santander_3dias, "duracion_media", "Santander - Lluvias >= 3 días", "Nº de\ndías", color_racha, color_tendencia)
+plot_duracion_media_lluvia_santander_7dias <- graficar_serie_anual(duracion_media_lluvia_santander_7dias, "duracion_media", "Santander - Lluvias >= 7 días", "Nº de\ndías", color_racha, color_tendencia)
+plot_duracion_media_lluvia_santander_15dias <- graficar_serie_anual(duracion_media_lluvia_santander_15dias, "duracion_media", "Santander - Lluvias >= 15 días", "Nº de\ndías", color_racha, color_tendencia)
+
+(plot_duracion_media_lluvia_tama_3dias | plot_duracion_media_lluvia_santander_3dias) /
+(plot_duracion_media_lluvia_tama_7dias | plot_duracion_media_lluvia_santander_7dias) /
+(plot_duracion_media_lluvia_tama_15dias | plot_duracion_media_lluvia_santander_15dias) +
+  plot_annotation(title = "Duración media anual de rachas de lluvia")
+```
+
+#### Porcentaje del tiempo total de lluvia por año
+```{r calculo_porcentaje_tiempo_total_lluvia, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular el porcentaje anual de tiempo ocupado por rachas de lluvia según duración mínima
+tiempo_total_lluvia_tama_3dias <- porcentaje_tiempo_total_racha(rachas_lluviosas_tama_3dias)
+tiempo_total_lluvia_santander_3dias <- porcentaje_tiempo_total_racha(rachas_lluviosas_santander_3dias)
+tiempo_total_lluvia_tama_7dias <- porcentaje_tiempo_total_racha(rachas_lluviosas_tama_7dias)
+tiempo_total_lluvia_santander_7dias <- porcentaje_tiempo_total_racha(rachas_lluviosas_santander_7dias)
+tiempo_total_lluvia_tama_15dias <- porcentaje_tiempo_total_racha(rachas_lluviosas_tama_15dias)
+tiempo_total_lluvia_santander_15dias <- porcentaje_tiempo_total_racha(rachas_lluviosas_santander_15dias)
+```
+
+```{r graficas_porcentaje_tiempo_total_lluvia, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Graficar el porcentaje anual de tiempo en rachas de lluvia según duración mínima y estación
+color_racha <- "lightblue1"
+color_tendencia <- "turquoise4"
+
+porcentaje_total_lluvia_anual_tama_3dias <- graficar_histograma_anual(tiempo_total_lluvia_tama_3dias, "porcentaje_anual", "Tama - Lluvia >= 3 días", "%", color_racha, color_tendencia)
+porcentaje_total_lluvia_anual_tama_7dias <- graficar_histograma_anual(tiempo_total_lluvia_tama_7dias, "porcentaje_anual", "Tama - Lluvia >= 7 días", "%", color_racha, color_tendencia)
+porcentaje_total_lluvia_anual_tama_15dias <- graficar_histograma_anual(tiempo_total_lluvia_tama_15dias, "porcentaje_anual", "Tama - Lluvia >= 15 días", "%", color_racha, color_tendencia)
+
+porcentaje_total_lluvia_anual_santander_3dias <- graficar_histograma_anual(tiempo_total_lluvia_santander_3dias, "porcentaje_anual", "Santander - Lluvia >= 3 días", "%", color_racha, color_tendencia)
+porcentaje_total_lluvia_anual_santander_7dias <- graficar_histograma_anual(tiempo_total_lluvia_santander_7dias, "porcentaje_anual", "Santander - Lluvia >= 7 días", "%", color_racha, color_tendencia)
+porcentaje_total_lluvia_anual_santander_15dias <- graficar_histograma_anual(tiempo_total_lluvia_santander_15dias, "porcentaje_anual", "Santander - Lluvia >= 15 días", "%", color_racha, color_tendencia)
+
+(porcentaje_total_lluvia_anual_tama_3dias | porcentaje_total_lluvia_anual_santander_3dias) /
+(porcentaje_total_lluvia_anual_tama_7dias | porcentaje_total_lluvia_anual_santander_7dias) /
+(porcentaje_total_lluvia_anual_tama_15dias | porcentaje_total_lluvia_anual_santander_15dias) +
+  plot_annotation(title = "Porcentaje anual de tiempo en lluvia con diferentes filtros de duración")
+```
+
+# Sección 4 - Evolución del régimen pluviométrico anual
+## 4.1 - Criterio de calidad de los años
+Antes de calcular los indicadores anuales de precipitación es necesario evaluar qué años tienen cobertura suficiente, para poder señalar visualmente en las gráficas correspondientes los años que se consideraron no válidos para los análisis por tener una conbertura insuficiente.
+
+`anios_validos()` cuenta los días con dato válido por año y marca como válidos los que superan el umbral de 330 días (~90.4% de cobertura anual, criterio OMM). Admite excepciones controladas: años que pueden incluirse aunque no alcancen el umbral principal, siempre que superen un umbral secundario (`umbral_excepcion` = 300 días). Se usa para el año 1985 de Tama (325 días). Los años inválidos permanecen en las series y se muestran visualmente destacados, pero se excluyen de las medias móviles y los tests estadísticos.
+```{r}
+# Evaluación de años válidos según cobertura de datos disponible
+umbral_dias <- 330  # ~90,4% de cobertura anual (criterio OMM)
+
+# Función para identificar años válidos con posibilidad de excepciones controladas
+anios_validos <- function(df_sin_na, excepciones = integer(0), umbral_excepcion = 300) {
+  df_sin_na %>%
+    group_by(anio) %>%
+    summarise(dias_con_dato = n(), .groups = "drop") %>%
+    mutate(
+      es_excepcion = anio %in% excepciones & dias_con_dato >= umbral_excepcion,
+      anio_valido = dias_con_dato >= umbral_dias | es_excepcion
+    )
+}
+
+# Aplicar criterio de calidad a cada estación
+calidad_tama <- anios_validos(datos_tama_sin_NA, excepciones = c(1985L), umbral_excepcion = 300)
+calidad_santander <- anios_validos(datos_santander_limpios)
+```
+
+La tabla de calidad generada documenta todos los años que no superan el umbral en cada estación y las excepciones admitidas, garantizando trazabilidad completa de las decisiones de tratamiento.
+```{r}
+# Tabla de años que no cumplen el criterio de calidad o tienen excepción aplicada
+bind_rows(
+  calidad_tama %>% mutate(estacion = "Tama"),
+  calidad_santander %>% mutate(estacion = "Santander")
+) %>%
+  filter(!anio_valido | es_excepcion) %>%
+  arrange(estacion, anio) %>%
+  select(estacion, anio, dias_con_dato, es_excepcion, anio_valido) %>%
+  knitr::kable(
+    col.names = c("Estación", "Año", "Días con dato", "Excepción aplicada", "Año válido"),
+    caption = "Años con cobertura inferior al criterio de calidad establecido (330 días/año) y excepciones admitidas."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE
+  )
+```
+
+## 4.2 - Indicadores anuales de precipitación
+`calculos_precipitacion()` calcula los tres indicadores anuales principales del régimen de precipitación: `total_prec` (suma anual en mm), `dias_lluvia` (número de días con prec > 0.1 mm) e `intensidad_media` (`total_prec` / `dias_lluvia`, NA si no hubo días de lluvia). Incorpora la tabla de calidad mediante `left_join` para que anio_valido esté disponible en las funciones de visualización.
+
+Se calculan medias móviles centradas de 5 años (`zoo::rollmean`) para cada indicador en df_intensidad (dataset combinado de ambas estaciones), excluyendo los años inválidos del cálculo para evitar que distorsionen la tendencia suavizada.
+```{r grafico_intensidad, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para calcular precipitación anual, días de lluvia e intensidad media
+calculos_precipitacion <- function(df, calidad) {
+  df %>%
+    group_by(anio) %>%
+    summarise(
+      total_prec = sum(prec, na.rm = TRUE),
+      dias_lluvia = sum(lluvia == TRUE, na.rm = TRUE),
+      intensidad_media = ifelse(dias_lluvia > 0, total_prec / dias_lluvia, NA),
+      .groups = "drop"
+    ) %>%
+    left_join(calidad, by = "anio")
+}
+
+# Calcular variables de precipitación para cada estación
+intensidad_tama <- calculos_precipitacion(datos_tama_sin_NA, calidad_tama)
+intensidad_santander <- calculos_precipitacion(datos_santander_limpios, calidad_santander)
+
+# Unir estaciones y calcular medias móviles de las variables de precipitación
+df_intensidad <- bind_rows(
+  intensidad_tama %>% mutate(estacion = "Tama"),
+  intensidad_santander %>% mutate(estacion = "Santander")
+) %>%
+  group_by(estacion) %>%
+  arrange(anio) %>%
+  mutate(
+    media_movil_prec = zoo::rollmean(total_prec, k = 5, fill = NA, align = "center"),
+    media_movil_int = zoo::rollmean(intensidad_media, k = 5, fill = NA, align = "center"),
+    media_movil_dias_lluvia = zoo::rollmean(dias_lluvia, k = 5, fill = NA, align = "center")
+  ) %>%
+  ungroup()
+```
+
+Las tres funciones de visualización responden a las preguntas centrales del análisis:
+
+- `plot_precipitacion_total()` muestra la precipitación total anual como barras (azul = válido, salmón = incompleto) con la media móvil en azul oscuro
+- `plot_dias_lluvia()` hace lo mismo para los días con lluvia en lila con media móvil orchid4
+- `plot_intensidad_media()` representa la intensidad como línea continua verde con la media móvil en verde claro, marcando los años inválidos con una cruz (×) dado que no hay distinción de color de relleno.
+
+Todas admiten `mostrar_leyenda` para suprimirla en los paneles superiores. El panel 3×2 combina las seis series para una comparación de conjunto.
+
+### 4.2.1 - Precipitación total anual
+```{r precipitacion_total, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para representar la precipitación anual y su tendencia mediante media móvil
+plot_precipitacion_total <- function(df, estacion, window = 5, mostrar_leyenda = TRUE) {
+  
+  df <- df %>%
+    arrange(anio) %>%
+    mutate(media_movil = zoo::rollmean(ifelse(anio_valido, total_prec, NA),
+                                       k = window, fill = NA, align = "center"))
+  
+  ggplot(df, aes(x = anio)) +
+    geom_col(aes(y = total_prec, fill = anio_valido), alpha = 0.7) +
+    scale_fill_manual(
+      values = c("TRUE" = "lightblue", "FALSE" = "salmon"),
+      labels = c("TRUE" = "Dato válido", "FALSE" = "Año incompleto"),
+      name = NULL
+    ) +
+    geom_line(aes(y = media_movil), color = "darkblue", size = 1.2) +
+    labs(title = estacion, y = "Precipitación (mm)", x = "Año") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = ifelse(mostrar_leyenda, "bottom", "none"))
+}
+
+# Generar gráficas para cada estación
+precipitacion_total_tama <- plot_precipitacion_total(intensidad_tama, "Tama", mostrar_leyenda = FALSE)
+precipitacion_total_santander <- plot_precipitacion_total(intensidad_santander, "Santander")
+
+precipitacion_total_tama / precipitacion_total_santander
+```
+
+### 4.2.2 - Número de días de lluvia
+```{r grafico_dias_lluvia_media_movil, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para representar los días de lluvia anuales y su tendencia mediante media móvil
+plot_dias_lluvia <- function(df_intensidad, estacion, window = 5, mostrar_leyenda = TRUE) {
+
+  df_intensidad <- df_intensidad %>%
+    arrange(anio) %>%
+    mutate(media_movil = zoo::rollmean(ifelse(anio_valido, dias_lluvia, NA),
+                                       k = window, fill = NA, align = "center"))
+
+  ggplot(df_intensidad, aes(x = anio, y = dias_lluvia)) +
+    geom_col(aes(fill = anio_valido), alpha = 0.7) +
+    scale_fill_manual(
+      values = c("TRUE" = "plum2", "FALSE" = "plum4"),
+      labels = c("TRUE" = "Dato válido", "FALSE" = "Año incompleto"),
+      name = NULL
+    ) +
+    geom_line(aes(y = media_movil), color = "orchid4", linewidth = 1.1) +
+    labs(title = estacion, x = "Año", y = "Días") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = ifelse(mostrar_leyenda, "bottom", "none")
+    )
+}
+
+# Generar gráficas para cada estación
+dias_lluvia_tama <- plot_dias_lluvia(intensidad_tama, "Tama", mostrar_leyenda = FALSE)
+dias_lluvia_santander <- plot_dias_lluvia(intensidad_santander, "Santander")
+
+dias_lluvia_tama / dias_lluvia_santander
+```
+
+### 4.2.3 - Intensidad media anual de precipitación
+```{r combinacion_intensidad_media_estaciones, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para representar la intensidad media anual de precipitación y su tendencia
+plot_intensidad_media <- function(df, estacion, window = 5) {
+  
+  df <- df %>%
+    arrange(anio) %>%
+    mutate(media_movil = zoo::rollmean(ifelse(anio_valido, intensidad_media, NA),
+                                       k = window, fill = NA, align = "center"))
+  
+  ggplot(df, aes(x = anio)) +
+    geom_line(aes(y = intensidad_media), color = "seagreen", alpha = 0.5) +
+    geom_point(
+      data = filter(df, !anio_valido),
+      aes(y = intensidad_media),
+      color = "black", size = 4, shape = 4
+    ) +
+    geom_line(aes(y = media_movil), color = "seagreen2", linewidth = 1.2) +
+    labs(
+      title = estacion,
+      y = expression(mm %.% "(" * días~de~lluvia * ")"^{-1}),
+      x = "Año"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+# Generar gráficas para cada estación
+intensidad_media_tama <- plot_intensidad_media(intensidad_tama, "Tama")
+intensidad_media_santander <- plot_intensidad_media(intensidad_santander, "Santander")
+
+intensidad_media_tama / intensidad_media_santander
+```
+
+```{r comparacion_graficas, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+# Comparación conjunta de precipitación total, días de lluvia e intensidad media por estación
+(precipitacion_total_tama | precipitacion_total_santander) /
+(dias_lluvia_tama | dias_lluvia_santander) /
+(intensidad_media_tama | intensidad_media_santander)
+```
+
+# Sección 5 - Comparación temporal de la persistencia de las rachas secas
+## 5.1 - Distribución de duración de rachas
+`comparar_distribuciones_rachas()` genera gráficos de densidad kernel superpuestos para comparar la distribución de duración de rachas secas entre el periodo histórico (hasta 1995, en dorado) y el reciente (desde 1996, en verde). El relleno semitransparente (alpha = 0.35) y el contorno más grueso (geom_density con fill = NA) permiten ver la forma de cada distribución con claridad. El eje x se limita a 40 días para centrar la atención en el rango con observaciones suficientes. El panel 3×2 compara los tres filtros de duración mínima por estación; las leyendas se suprimen en los paneles superiores.
+```{r comparacion_periodos_graficas_sueltas, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para comparar la distribución de duración de rachas entre dos periodos
+comparar_distribuciones_rachas <- function(rachas_df, corte_anio = 1995,
+                                           titulo = NULL, mostrar_leyenda = TRUE) {
+
+  rachas_df$periodo <- ifelse(rachas_df$inicio_anio <= corte_anio,
+                              "Histórico", "Reciente")
+
+  cols_fill <- c("Histórico" = "goldenrod1", "Reciente" = "seagreen2")
+  cols_line <- c("Histórico" = "goldenrod4", "Reciente" = "seagreen4")
+
+  p <- ggplot(rachas_df, aes(x = duracion, fill = periodo, colour = periodo)) +
+    geom_density(alpha = 0.35, size = 0.6) +
+    geom_density(aes(y = ..density..), colour = NA, alpha = 0) +
+    geom_density(fill = NA, size = 1.2, alpha = 1) +
+    scale_fill_manual(values = cols_fill) +
+    scale_colour_manual(values = cols_line,
+                        guide = guide_legend(override.aes = list(fill = NA))) +
+    labs(x = "Duración / días", y = "Densidad") +
+    xlim(0, 40) +
+    theme_minimal()
+
+  p <- p + theme(legend.position = ifelse(mostrar_leyenda, "bottom", "none"))
+
+  if (!is.null(titulo)) p <- p + labs(title = titulo)
+
+  p
+}
+```
+
+```{r comparacion_periodos_graficas_sueltas_final, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+# Comparación de distribuciones de duración de rachas de sequía por estación y umbral
+comparacion_tama_3 <- comparar_distribuciones_rachas(rachas_secas_tama_3dias, 1995, "Tama - Sequías >= 3 días", FALSE)
+comparacion_santander_3 <- comparar_distribuciones_rachas(rachas_secas_santander_3dias, 1995, "Santander - Sequías >= 3 días", FALSE)
+
+comparacion_tama_7 <- comparar_distribuciones_rachas(rachas_secas_tama_7dias, 1995, "Tama - Sequías >= 7 días", FALSE)
+comparacion_santander_7 <- comparar_distribuciones_rachas(rachas_secas_santander_7dias, 1995, "Santander - Sequías >= 7 días", FALSE)
+
+comparacion_tama_15 <- comparar_distribuciones_rachas(rachas_secas_tama_15dias, 1995, "Tama - Sequías >= 15 días", FALSE)
+comparacion_santander_15 <- comparar_distribuciones_rachas(rachas_secas_santander_15dias, 1995, "Santander - Sequías >= 15 días")
+
+(comparacion_tama_3 | comparacion_santander_3) /
+(comparacion_tama_7 | comparacion_santander_7) /
+(comparacion_tama_15 | comparacion_santander_15) +
+  plot_annotation(title = "Comparación de distribuciones de duraciones de rachas de sequía entre periodos histórico y reciente")
+```
+
+## 5.2 - ECDF (función de distribución acumulada)
+`comparar_ecdf()` construye la función de distribución acumulada empírica (ECDF) de las duraciones de rachas secas usando geom_step con `stat` = "ecdf", sin suavizado ni bins arbitrarios. Cada estación aparece en una faceta separada.
+
+La función `crear_ecdf()` simplifica la llamada combinando los datos de ambas estaciones con `bind_rows()` (añadiendo la columna `estacion`) y llamando a `comparar_ecdf()` con el filtro de duración indicado. El panel horizontal triple con los tres filtros permite evaluar la robustez del resultado: si la ausencia de cambio entre periodos se mantiene con los tres umbrales, la conclusión es sólida e independiente del umbral elegido.
+```{r ecdf_comparacion_periodos2, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para comparar la ECDF de duraciones de rachas entre periodos y estaciones
+comparar_ecdf <- function(rachas_df, corte_anio = 1995,
+                          titulo = "ECDF de duraciones de rachas por periodo",
+                          mostrar_leyenda = TRUE) {
+  
+  rachas_df <- rachas_df %>%
+    mutate(periodo = ifelse(inicio_anio <= corte_anio, "Histórico", "Reciente"),
+           estacion = as.factor(estacion)
+    )
+  
+  p <- ggplot(rachas_df, aes(duracion, color = periodo)) +
+    geom_step(stat = "ecdf", linewidth = 1) +
+    facet_wrap(~estacion) +
+    labs(x = "Duración / días", y = "ECDF", title = titulo) +
+    scale_color_manual(values = c("Histórico" = "goldenrod2", "Reciente" = "seagreen3")) +
+    theme_minimal() +
+    theme(legend.position = ifelse(mostrar_leyenda, "bottom", "none"))
+  
+  p
+}
+```
+
+```{r ecdf_comparacion_periodos_final2, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5, fig.align="center"}
+# Preparar datos y graficar ECDF para distintos filtros de duración de rachas
+crear_ecdf <- function(tama, santander, filtro) {
+  df <- bind_rows(
+    tama %>% mutate(estacion = "Tama"),
+    santander %>% mutate(estacion = "Santander")
+  )
+  comparar_ecdf(df, corte_anio = 1995,
+                titulo = paste("Rachas de sequía >=", filtro, "días"),
+                mostrar_leyenda = FALSE)
+}
+
+ecdf_3dias  <- crear_ecdf(rachas_secas_tama_3dias, rachas_secas_santander_3dias, 3)
+ecdf_7dias  <- crear_ecdf(rachas_secas_tama_7dias, rachas_secas_santander_7dias, 7)
+ecdf_15dias <- crear_ecdf(rachas_secas_tama_15dias, rachas_secas_santander_15dias, 15)
+
+(ecdf_3dias | ecdf_7dias | ecdf_15dias) +
+  plot_annotation(title = "Comparación de ECDF de duraciones de rachas entre periodos histórico y reciente",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+## 5.3 - Distribución mensual del número de rachas y duración media
+Para la comparación por mes entre periodos definimos los parámetros globales (`corte_anio` = 1995, paleta dorado/verde) y la función auxiliar `etiquetar_periodos()`, que añade la columna `periodo` y `mes_label` como factor ordenado de enero a diciembre a cualquier dataframe de rachas.
+
+- `plot_rachas_por_mes()` genera barras agrupadas por mes y periodo mostrando el número total de rachas iniciadas cada mes, respondiendo a si hay meses en los que las sequías se están volviendo más frecuentes.
+- `plot_duracion_media_mes()` genera barras análogas con la duración media de las rachas iniciadas en cada mes, respondiendo a si en algún mes las sequías están siendo más largas.
+- `comparar_rachas_mes()` combina ambas funciones en un panel 2×2 para cada filtro de duración mínima, aplicándose a los tres filtros de forma iterativa.
+
+```{r comparacion_histogramas_superpuestos, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Parámetros y función para clasificar rachas según periodo histórico o reciente
+corte_anio <- 1995
+cols_fill <- c("Histórico" = "goldenrod2", "Reciente" = "seagreen3")
+nombres_meses <- c("Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic")
+
+etiquetar_periodos <- function(rachas_df, corte = corte_anio) {
+  rachas_df %>%
+    mutate(periodo = ifelse(inicio_anio <= corte, "Histórico", "Reciente"),
+           mes_label = factor(nombres_meses[inicio_mes], levels = nombres_meses)
+    )
+}
+```
+
+```{r rachas_por_mes, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para representar el número de rachas por mes y periodo
+plot_rachas_por_mes <- function(rachas_df, titulo = "", mostrar_leyenda = TRUE) {
+  
+  df <- etiquetar_periodos(rachas_df) %>%
+    group_by(periodo, mes_label) %>%
+    summarise(num_rachas = n(), .groups = "drop")
+  
+  p <- ggplot(df, aes(x = mes_label, y = num_rachas, fill = periodo)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.65, alpha = 0.85) +
+    scale_fill_manual(values = cols_fill, name = NULL) +
+    labs(title = titulo, x = NULL, y = "Nº de rachas") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+      legend.position = "bottom",
+      axis.text.x = element_text(size = 8)
+    )
+  
+  if (!mostrar_leyenda) p <- p + theme(legend.position = "none")
+  
+  p
+}
+```
+
+```{r test_duracion_media_mes, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para representar la duración media de rachas por mes comparando periodos
+plot_duracion_media_mes <- function(rachas_df, titulo = "", mostrar_leyenda = TRUE) {
+  
+  df <- etiquetar_periodos(rachas_df) %>%
+    group_by(periodo, mes_label) %>%
+    summarise(dur_media = mean(duracion, na.rm = TRUE), .groups = "drop")
+  
+  p <- ggplot(df, aes(mes_label, dur_media, fill = periodo)) +
+    geom_col(position = position_dodge(.7), width = .65, alpha = .85) +
+    scale_fill_manual(values = cols_fill, name = NULL) +
+    labs(title = titulo, x = NULL, y = "Duración media (días)") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = .5, face = "bold", size = 10),
+      legend.position = ifelse(mostrar_leyenda, "bottom", "none"),
+      axis.text.x = element_text(size = 8)
+    )
+  
+  p
+}
+```
+
+```{r comparacion_histogramas_superpuestos_final, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Función para comparar número y duración media de rachas entre periodos según filtro de duración
+comparar_rachas_mes <- function(rachas_tama, rachas_santander, filtro) {
+  
+  (plot_rachas_por_mes(rachas_tama, "Tama", mostrar_leyenda = FALSE) |
+   plot_rachas_por_mes(rachas_santander, "Santander", mostrar_leyenda = FALSE)) /
+  (plot_duracion_media_mes(rachas_tama, mostrar_leyenda = FALSE) |
+   plot_duracion_media_mes(rachas_santander)) +
+    plot_annotation(
+      title = paste("Comparación de periodos Histórico vs Reciente — Sequías >=", filtro, "días"),
+      theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+    )
+}
+
+# Aplicación para distintos filtros de duración
+comparar_rachas_mes(rachas_secas_tama_3dias, rachas_secas_santander_3dias, 3)
+comparar_rachas_mes(rachas_secas_tama_7dias, rachas_secas_santander_7dias, 7)
+comparar_rachas_mes(rachas_secas_tama_15dias, rachas_secas_santander_15dias, 15)
+```
+
+# Sección 6 - Test de Mann-Kendall, pendiente de Sen y test de Pettitt
+## 6.1 - Estadísticas de las series anuales principales
+`test_mann_kendall()` centraliza todos los análisis de tendencia del documento y es idéntica a la usada en los bloques de temperatura y nivel del mar del TFM, garantizando coherencia metodológica en los tres análisis. Integra en una única llamada cuatro análisis:
+
+1. **Detección de autocorrelación**: calcula el ACF en el lag 1 y lo compara con el intervalo de confianza al 95% (1.96/√n), umbral que depende del tamaño muestral de cada serie concreta.
+2. **Selección automática del método**: si `|acf_lag1| <= 1.96/√n` aplica el test estándar (`mk.test`); si lo supera aplica TFPW (`tfpwmk`), que elimina la tendencia lineal antes del blanqueo para evitar inflar el estadístico.
+3. **Estimador de Sen**: calcula la pendiente mediana de Theil-Sen con IC al 95% siempre sobre la serie original, antes de cualquier transformación.
+4. **Test de Pettitt**: detecta el año de cambio más probable sin asumir normalidad, traduciendo el índice K al año mediante un join con el dataframe de entrada.
+
+Devuelve un tibble de una fila con todos los estadísticos y sus niveles de significancia codificados (** $p$<0.01, * $p$<0.05, · $p$<0.10).
+
+```{r test_mk_function, echo=TRUE, message=FALSE, warning=FALSE}
+# Aplica Mann-Kendall (estándar o TFPW según autocorrelación), pendiente de Sen y test de Pettitt
+test_mann_kendall <- function(df, variable, serie_label = "", metodo = "auto") {
+  serie <- df %>%
+    arrange(across(any_of(c("anio", "inicio_anio")))) %>%
+    pull({{ variable }}) %>%
+    na.omit()
+
+  # Selección automática del método según la autocorrelación de orden 1
+  n <- length(serie)
+  acf_lag1 <- acf(serie, lag.max = 1, plot = FALSE)$acf[2]
+  limite_acf <- 1.96 / sqrt(n)
+  metodo_usado <- if (metodo == "auto") ifelse(abs(acf_lag1) > limite_acf, "tfpw", "estandar") else metodo
+
+  if (metodo_usado == "estandar") {
+    mk <- mk.test(serie)
+    tau <- unname(mk$estimates["tau"])
+    p_valor <- mk$p.value
+  } else {
+    mk <- tfpwmk(serie)
+    tau <- unname(mk[grep("Tau", names(mk), ignore.case = TRUE)])
+    p_valor <- unname(mk[grep("p.value|P.value", names(mk), ignore.case = TRUE)])
+  }
+
+  sen <- sens.slope(serie)
+  pt <- pettitt.test(serie)
+
+  # Año asociado al cambio detectado por Pettitt
+  k_anio <- df %>%
+    arrange(across(any_of(c("anio", "inicio_anio")))) %>%
+    filter(!is.na({{ variable }})) %>%
+    slice(as.integer(pt$estimate[1])) %>%
+    pull(any_of(c("anio", "inicio_anio")))
+
+  tibble(
+    serie = serie_label, metodo = metodo_usado, acf_lag1 = round(acf_lag1, 3),
+    tau = round(tau, 4), p_valor_mk = round(p_valor, 4),
+    sen_slope = round(sen$estimates, 4), sen_inf = round(sen$conf.int[1], 4),
+    sen_sup = round(sen$conf.int[2], 4),
+    interpretacion = case_when(
+      p_valor < 0.05 & sen_slope > 0 ~ "Creciente", p_valor < 0.05 & sen_slope < 0 ~ "Decreciente",
+      TRUE ~ "Sin tendencia clara"
+    ),
+    signif_mk = case_when(p_valor < 0.01 ~ "**", p_valor < 0.05 ~ "*", p_valor < 0.10 ~ ".", TRUE ~ ""),
+    K_anio = if (length(k_anio)) as.integer(k_anio) else NA_integer_,
+    p_valor_pt = round(pt$p.value, 4),
+    signif_pt = case_when(pt$p.value < 0.01 ~ "**", pt$p.value < 0.05 ~ "*", pt$p.value < 0.10 ~ ".", TRUE ~ "")
+  )
+}
+```
+
+Tras aplicar `test_mann_kendall()` a las seis series anuales principales (precipitación total, intensidad media y días de lluvia para Tama y Santander), los resultados se presentan en una tabla formateada con `add_header_above()` que agrupa visualmente las columnas en tres secciones: _Mann-Kendall_ (método, ACF, tau, p-valor), _Pendiente de Sen_ (estimación e IC 95%) y _Pettitt_ (año de cambio, p-valor, significancia).
+```{r test_mk_aplicacion, echo=TRUE, message=FALSE, warning=FALSE}
+# Aplicar los tests a cada combinación de estación y variable
+tabla_mk_prec <- bind_rows(
+  test_mann_kendall(intensidad_tama, total_prec, "Tama - Precipitación total anual"),
+  test_mann_kendall(intensidad_santander, total_prec, "Santander - Precipitación total anual"),
+  test_mann_kendall(intensidad_tama, intensidad_media, "Tama - Intensidad media"  ),
+  test_mann_kendall(intensidad_santander, intensidad_media, "Santander - Intensidad media"),
+  test_mann_kendall(intensidad_tama, dias_lluvia, "Tama - Días de lluvia"),
+  test_mann_kendall(intensidad_santander, dias_lluvia, "Santander - Días de lluvia")
+)
+
+# Mostrar resultados de tendencia y cambios detectados
+tabla_mk_prec %>%
+  knitr::kable(
+    col.names = c("Serie", "Método", "ACF", "Tau", "p-valor", "Pendiente", "IC inf.", "IC sup.", 
+                  "Interpretación", "Signif.", "Año cambio", "p-valor", "Signif."),
+    digits = c(NA, NA, 3, 4, 4, 4, 4, 4, NA, NA, 0, 4, NA),
+    caption = "Resultados de tendencia (Mann-Kendall y Sen) y cambios (Pettitt). Significancia: ** p<0,01; * p<0,05; . p<0,10."
+  ) %>%
+  add_header_above(c(" " = 3, "Mann-Kendall" = 3, "Pendiente de Sen" = 4, "Pettitt" = 3)) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE, position = "center"
+  )
+```
+
+## 6.2 - Puntos de cambio robustos
+Para verificar que los puntos de cambio detectados no son artefactos de los años con datos incompletos, `pettitt_robusto()` repite el test de Pettitt excluyendo previamente todos los años con `anio_valido == FALSE`. Devuelve el año de cambio revisado (`K_anio_rob`), su p-valor y significancia. Se aplica a las seis series mediante una lista iterada con `lapply()`.
+```{r pettitt_robusto_function, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para aplicar Pettitt excluyendo años con cobertura insuficiente
+pettitt_robusto <- function(df, variable, serie_label = "") {
+  
+  anio_col <- ifelse("anio" %in% names(df), "anio", "inicio_anio")
+  
+  df <- df %>%
+    filter(anio_valido, !is.na(.data[[variable]])) %>%
+    arrange(.data[[anio_col]])
+  
+  pt <- pettitt.test(df[[variable]])
+  k <- as.integer(pt$estimate[1])
+  
+  tibble(
+    serie = serie_label,
+    n_validos = nrow(df),
+    K_anio_rob = ifelse(k <= nrow(df), df[[anio_col]][k], NA),
+    p_valor_rob = round(pt$p.value, 4),
+    signif_rob = case_when(pt$p.value < .01 ~ "**", pt$p.value < .05 ~ "*", pt$p.value < .10 ~ ".", TRUE ~ "")
+  )
+}
+```
+
+El resultado se une a `tabla_mk_prec` mediante `left_join` y construye `tabla_mk_prec_robusta`, que añade la columna `cambio_anio` (`TRUE` si el año de cambio se desplazó al excluir años inválidos). La tabla comparativa con `add_header_above` permite identificar de un vistazo qué puntos de cambio son genuinos y cuáles eran parcialmente artefactos.
+```{r pettitt_robusto_aplicacion, echo=TRUE, message=FALSE, warning=FALSE}
+# Calcular puntos de cambio robustos para todas las series
+series_rob <- list(
+  list(intensidad_tama, "total_prec", "Tama - Precipitación total anual"),
+  list(intensidad_santander, "total_prec", "Santander - Precipitación total anual"),
+  list(intensidad_tama, "intensidad_media", "Tama - Intensidad media"),
+  list(intensidad_santander, "intensidad_media", "Santander - Intensidad media"),
+  list(intensidad_tama, "dias_lluvia", "Tama - Días de lluvia"),
+  list(intensidad_santander, "dias_lluvia", "Santander - Días de lluvia")
+)
+
+tabla_rob <- bind_rows(lapply(series_rob, \(x) pettitt_robusto(x[[1]], x[[2]], x[[3]])))
+
+# Comparar los resultados del test de Pettitt original y robusto
+tabla_mk_prec_robusta <- tabla_mk_prec %>%
+  left_join(
+    tabla_rob %>% select(serie, K_anio_rob, p_valor_rob, signif_rob),
+    by = "serie"
+  ) %>%
+  mutate(K_anio_original = K_anio, K_anio = K_anio_rob, cambio_anio = K_anio_original != K_anio_rob)
+
+tabla_mk_prec_robusta %>%
+  select(serie, K_anio_original, p_valor_pt, signif_pt, K_anio_rob, p_valor_rob, signif_rob, cambio_anio
+  ) %>%
+  knitr::kable(
+    col.names = c("Serie", "Año cambio (original)", "p-valor", "Sig.", "Año cambio (robusto)", "p-valor", "Sig.", "¿Cambió?"),
+    digits = c(NA, 0, 4, NA, 0, 4, NA, NA),
+    caption = "Comparación entre puntos de cambio originales y robustos tras excluir años con datos incompletos."
+  ) %>%
+  add_header_above(c(" " = 1, "Pettitt original" = 3, "Pettitt robusto" = 3, " " = 1)) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE, position = "center"
+  )
+```
+
+# Sección 7 - Análisis de sensibilidad al excluir los meses primaverales
+## 7.1 - Integración de tendencias y puntos de cambio en los gráficos
+`add_mk_layers()` enriquece cualquier gráfico de serie temporal base con dos capas analíticas: la línea de Sen (recta anclada en la mediana de los años y la mediana de los valores, extendida de extremo a extremo) y la línea vertical de Pettitt (solo si `p_valor_pt` < 0.05). Busca los estadísticos en `tabla_mk` mediante `serie_label`, lo que permite aplicarla a cualquier serie con una única llamada.
+
+La función `aplicar_mk()` actúa como envoltura que fija tabla_mk_prec_robusta como tabla de referencia, y se aplica en batch a las seis series almacenadas en la lista `graficas` mediante `lapply()` y `list2env()`. El panel 3×2 final muestra las seis series con sus tendencias y puntos de cambio integrados directamente sobre los gráficos de barras.
+```{r fincion_auxiliar_anadir_mk, echo=TRUE, message=FALSE, warning=FALSE}
+add_mk_layers <- function(p, df, variable, tabla_mk, serie_label, color_sen = "red", color_pt = "darkred") {
+  
+  # Buscar resultados del test para la serie seleccionada
+  mk <- tabla_mk %>% filter(serie == serie_label)
+  
+  if (!nrow(mk)) return(p)
+  
+  # Preparar serie y ordenar cronológicamente
+  anio_col <- ifelse("anio" %in% names(df), "anio", "inicio_anio")
+  
+  df <- df %>%
+    arrange(.data[[anio_col]]) %>%
+    filter(!is.na(.data[[variable]]))
+  
+  anios <- df[[anio_col]]
+  vals <- df[[variable]]
+  
+  # Añadir línea de tendencia de Sen
+  p <- p +
+    geom_line(
+      data = tibble(x = range(anios), y = median(vals) + mk$sen_slope * (x - median(anios))),
+      aes(x, y), inherit.aes = FALSE, color = color_sen, linewidth = 1)
+  
+  # Añadir punto de cambio de Pettitt si es significativo
+  if (!is.na(mk$K_anio) && mk$p_valor_pt < 0.05) {
+    p <- p +
+      geom_vline(xintercept = mk$K_anio, color = color_pt, linetype = "dotdash", linewidth = 0.9)
+  }
+  
+  return(p)
+}
+```
+
+```{r grafica_serie_mk_final_con_funcion, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=8, fig.align="center"}
+# Función auxiliar para añadir la tendencia de Sen y el cambio de Pettitt
+aplicar_mk <- function(g, df, var, serie) {
+  add_mk_layers(g, df, var, tabla_mk_prec_robusta, serie)
+}
+
+graficas <- list(
+  precipitacion_total_tama = list(plot_precipitacion_total(intensidad_tama, "Tama"), intensidad_tama, "total_prec", "Tama - Precipitación total anual"),
+  precipitacion_total_santander = list(plot_precipitacion_total(intensidad_santander, "Santander"), intensidad_santander, "total_prec", "Santander - Precipitación total anual"),
+  dias_lluvia_tama = list(plot_dias_lluvia(intensidad_tama, "Tama"), intensidad_tama, "dias_lluvia", "Tama - Días de lluvia"),
+  dias_lluvia_santander = list(plot_dias_lluvia(intensidad_santander, "Santander"), intensidad_santander, "dias_lluvia", "Santander - Días de lluvia"),
+  intensidad_media_tama = list(plot_intensidad_media(intensidad_tama, "Tama"), intensidad_tama, "intensidad_media", "Tama - Intensidad media"),
+  intensidad_media_santander = list(plot_intensidad_media(intensidad_santander, "Santander"), intensidad_santander, "intensidad_media", "Santander - Intensidad media")
+)
+
+list2env(lapply(graficas, \(x) aplicar_mk(x[[1]], x[[2]], x[[3]], x[[4]])),
+         envir = .GlobalEnv)
+
+# Panel comparativo
+(precipitacion_total_tama | precipitacion_total_santander) /
+(dias_lluvia_tama | dias_lluvia_santander) /
+(intensidad_media_tama | intensidad_media_santander) +
+  plot_annotation(title = "Precipitación: tendencia (Sen) y punto de cambio (Pettitt)")
+```
+
+## 7.2 - Exclusión de meses de primavera (abril y mayo)
+Para cuantificar la contribución de los meses de primavera a las tendencias detectadas, `calcular_metricas_sin_meses()` recalcula los tres indicadores anuales (precipitación total, días de lluvia e intensidad media) excluyendo los meses indicados en meses_excluir antes de agregar por año. Se generan tres versiones para cada estación: serie completa, sin abril (mes 4) y sin abril y mayo (meses 4 y 5).
+```{r calculo_metricas_sin_meses, echo=TRUE, message=FALSE, warning=FALSE}
+# Métricas anuales con opción de excluir meses
+calcular_metricas_sin_meses <- function(df, calidad, meses_excluir = c()) {
+
+  df %>%
+    filter(!mes %in% meses_excluir) %>%
+    group_by(anio) %>%
+    summarise(total_prec  = sum(prec, na.rm = TRUE),
+              dias_lluvia = sum(lluvia == TRUE, na.rm = TRUE),
+              intensidad_media = ifelse(dias_lluvia > 0, 
+                                        total_prec / dias_lluvia, NA),
+              dias_con_dato_anioIncompleto = sum(!is.na(prec)),
+              .groups = "drop"
+              ) %>%
+    left_join(calidad, by = "anio")
+}
+
+# Sin abril
+metricas_tama_sinAbr <- calcular_metricas_sin_meses(datos_tama_sin_NA, calidad_tama, 4)
+metricas_santander_sinAbr <- calcular_metricas_sin_meses(datos_santander_limpios, calidad_santander, 4)
+
+# Sin abril y mayo
+metricas_tama_sinAbrMay <- calcular_metricas_sin_meses(datos_tama_sin_NA, calidad_tama, c(4, 5))
+metricas_santander_sinAbrMay <- calcular_metricas_sin_meses(datos_santander_limpios, calidad_santander, c(4, 5))
+```
+
+Aplicando `test_mann_kendall()` a las 18 series resultantes se construye `tabla_sensibilidad`, que compara las pendientes de Sen y los p-valores entre escenarios. La tabla presentada con `kableExtra` organiza los resultados agrupados por variable, estación y escenario para facilitar la comparación directa.
+```{r tabla_sensibilidad_mk, echo=TRUE, message=FALSE, warning=FALSE}
+# Comparación de tendencias: completa vs sensibilidad (abril / abril-mayo)
+tabla_sensibilidad <- bind_rows(
+
+  # Serie completa
+  test_mann_kendall(intensidad_tama, total_prec, "Tama - Prec. total (completa)"),
+  test_mann_kendall(intensidad_santander, total_prec, "Santander - Prec. total (completa)"),
+  test_mann_kendall(intensidad_tama, intensidad_media, "Tama - Intensidad (completa)"),
+  test_mann_kendall(intensidad_santander, intensidad_media, "Santander - Intensidad (completa)"),
+  test_mann_kendall(intensidad_tama, dias_lluvia, "Tama - Días lluvia (completa)"),
+  test_mann_kendall(intensidad_santander, dias_lluvia,"Santander - Días lluvia (completa)"),
+
+  # Sin abril
+  test_mann_kendall(metricas_tama_sinAbr, total_prec, "Tama - Prec. total (sin abril)"),
+  test_mann_kendall(metricas_santander_sinAbr, total_prec, "Santander - Prec. total (sin abril)"),
+  test_mann_kendall(metricas_tama_sinAbr, intensidad_media, "Tama - Intensidad (sin abril)"),
+  test_mann_kendall(metricas_santander_sinAbr, intensidad_media, "Santander - Intensidad (sin abril)"),
+  test_mann_kendall(metricas_tama_sinAbr, dias_lluvia, "Tama - Días lluvia (sin abril)"),
+  test_mann_kendall(metricas_santander_sinAbr, dias_lluvia, "Santander - Días lluvia (sin abril)"),
+
+  # Sin abril y mayo
+  test_mann_kendall(metricas_tama_sinAbrMay, total_prec, "Tama - Prec. total (sin abr-may)"),
+  test_mann_kendall(metricas_santander_sinAbrMay, total_prec, "Santander - Prec. total (sin abr-may)"),
+  test_mann_kendall(metricas_tama_sinAbrMay, intensidad_media, "Tama - Intensidad (sin abr-may)"),
+  test_mann_kendall(metricas_santander_sinAbrMay, intensidad_media, "Santander - Intensidad (sin abr-may)"),
+  test_mann_kendall(metricas_tama_sinAbrMay, dias_lluvia, "Tama - Días lluvia (sin abr-may)"),
+  test_mann_kendall(metricas_santander_sinAbrMay, dias_lluvia, "Santander - Días lluvia (sin abr-may)")
+)
+```
+
+```{r}
+tabla_sensibilidad %>%
+  mutate(
+    escenario = case_when(
+      grepl("completa", serie) ~ "Serie completa",
+      grepl("sin abril\\)", serie) ~ "Sin abril",
+      TRUE ~ "Sin abril-mayo"
+    ),
+    serie_base = ifelse(grepl("Tama", serie), "Tama", "Santander"),
+    variable = case_when(
+      grepl("Prec", serie) ~ "Precipitación total",
+      grepl("Intensidad", serie) ~ "Intensidad media",
+      TRUE ~ "Días de lluvia"
+    ),
+    escenario = factor(escenario,
+      levels = c("Serie completa", "Sin abril", "Sin abril-mayo")
+    )
+  ) %>%
+  arrange(variable, serie_base, escenario) %>%
+  select(
+    serie_base, variable, escenario, metodo,
+    tau, p_valor_mk, sen_slope, sen_inf, sen_sup,
+    interpretacion, signif_mk
+  ) %>%
+  knitr::kable(
+    col.names = c("Estación", "Variable", "Escenario", "Método", "Tau", "p-valor MK", "Pendiente Sen",
+                  "IC 95% inf.", "IC 95% sup.", "Tendencia", "Sig."),
+    digits = c(NA, NA, NA, NA, 4, 4, 4, 3, 3, NA, NA),
+    caption = "Sensibilidad de las tendencias detectadas frente a la eliminación de abril y abril-mayo."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE, position = "center"
+  )
+```
+
+`plot_sensibilidad_sen()` combina en un único gráfico las tres líneas de Sen (serie completa = rojo continuo, sin abril = naranja discontinuo, sin abril y mayo = morado punto-raya) sobre la misma serie subyacente, con sus medias móviles de 5 años.
+
+La función auxiliar `interna make_sen_df()` calcula los dos puntos extremos de cada recta de Sen; `get_sen()` busca la pendiente en `tabla_mk` por etiqueta de serie.
+
+Los parámetros de visualización son altamente configurables: tipo de representación base (barras o línea), visibilidad de la media móvil, leyendas independientes para barras y líneas Sen, unidades en el eje y, títulos y subtítulos. El panel 3×2 (filas = variable, columnas = estación) se construye con p1-p6 configurados individualmente para suprimir leyendas duplicadas: solo p1 y p2 muestra la leyenda de barras y solo p6 muestra la leyenda de las líneas Sen, con el pie de figura describiendo la codificación.
+```{r graficas_sensibilidad_sen, echo=TRUE, message=FALSE, warning=FALSE}
+plot_sensibilidad_sen <- function(
+  df_completa, df_sinAbr, df_sinAbrMay,
+  variable, estacion, tabla_mk,
+  color_anio_valido="lightblue", color_anio_invalido="salmon",
+  color_linea="grey40", color_media_movil="darkblue",
+  color_sen_completa="firebrick", color_sen_sinAbr="tan1", color_sen_sinAbrMay="chartreuse4",
+  mostrar_barras=TRUE, mostrar_linea=FALSE, mostrar_media_movil=TRUE,
+  mostrar_leyenda_barras=TRUE, mostrar_leyenda_sen=TRUE,
+  mostrar_unidad_y=TRUE, mostrar_titulo=TRUE, mostrar_subtitulo=TRUE, mostrar_titulo_y=TRUE,
+  mostrar_titulo_x=TRUE, mostrar_cruces_invalidos=FALSE, window=5
+) {
+
+  # ─────────────────────────────────────────────────────────────
+  # 1. Columna de año (robusto a diferentes nombres)
+  # ─────────────────────────────────────────────────────────────
+  anio_col <- if ("anio" %in% names(df_completa)) "anio" else "inicio_anio"
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. Metadatos de la variable (nombre + unidad)
+  # ─────────────────────────────────────────────────────────────
+  info <- switch(variable, 
+                 total_prec=list("Precipitación total","mm"),
+                 dias_lluvia=list("Días con lluvia","días"),
+                 intensidad_media=list("Intensidad media","mm/días de lluvia"),
+                 list(variable,"")
+  )
+
+  nombre_variable <- info[[1]]
+  unidad_variable <- info[[2]]
+
+  # Etiquetas de ejes según flags
+  ylab <- if (mostrar_titulo_y)
+    if (mostrar_unidad_y)
+      paste0(nombre_variable," (",unidad_variable,")")
+    else nombre_variable
+  else NULL
+
+  xlabel <- if (mostrar_titulo_x) "Año" else NULL
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. Etiquetas de leyenda (series Sen)
+  # ─────────────────────────────────────────────────────────────
+  lab <- c("Serie completa","Sin abril","Sin abril y mayo")
+
+  nombre_corto <- switch(variable, total_prec="Prec. total", dias_lluvia="Días lluvia",
+                         intensidad_media="Intensidad", variable)
+
+  # ─────────────────────────────────────────────────────────────
+  # 4. Extracción de pendientes Sen desde tabla
+  # ─────────────────────────────────────────────────────────────
+  get_sen <- function(suf){
+    etiqueta <- paste0(estacion," - ",nombre_corto," (",suf,")")
+    res <- tabla_mk %>% filter(serie==etiqueta) %>% slice(1) %>% pull(sen_slope)
+
+    if (length(res)==0) {
+      warning(paste("No encontrado:",etiqueta))
+      return(NA_real_)
+    }
+
+    res
+  }
+
+  slopes <- c(get_sen("completa"), get_sen("sin abril"), get_sen("sin abr-may"))
+
+  # ─────────────────────────────────────────────────────────────
+  # 5. Preparación de datos base
+  # ─────────────────────────────────────────────────────────────
+
+  # Asegura existencia de variable de validez del año
+  if (!"anio_valido" %in% names(df_completa))
+    df_completa$anio_valido <- TRUE
+
+  # Cálculo de media móvil (solo con años válidos)
+  df_completa <- df_completa %>%
+    arrange(.data[[anio_col]]) %>%
+    mutate(media_movil = zoo::rollmean(
+      ifelse(anio_valido,.data[[variable]],NA),
+      k=window, fill=NA, align="center"
+    ))
+
+  # ─────────────────────────────────────────────────────────────
+  # 6. Construcción de líneas Sen (tendencias)
+  # ─────────────────────────────────────────────────────────────
+  make_sen_df <- function(df,slope,label){
+
+    # Si no hay pendiente, no se dibuja línea
+    if (is.na(slope))
+      return(tibble(x=numeric(),ysen=numeric(),caso=character()))
+
+    vals  <- df[[variable]]
+    anios <- df[[anio_col]]
+
+    med_a <- median(anios,na.rm=TRUE)
+    med_v <- median(vals,na.rm=TRUE)
+
+    tibble(
+      x=c(min(anios),max(anios)),
+      ysen=med_v + slope*(c(min(anios),max(anios)) - med_a),
+      caso=label
+    )
+  }
+
+  # Unión de las tres versiones de Sen
+  sen_all <- bind_rows(make_sen_df(df_completa, slopes[1], lab[1]),
+                       make_sen_df(df_sinAbr, slopes[2], lab[2]),
+                       make_sen_df(df_sinAbrMay, slopes[3], lab[3])
+                       ) %>%
+    mutate(caso=factor(caso,levels=lab))
+
+  # ─────────────────────────────────────────────────────────────
+  # 7. Base del gráfico
+  # ─────────────────────────────────────────────────────────────
+  p <- ggplot(df_completa,aes(x=.data[[anio_col]],y=.data[[variable]]))
+
+  # ─────────────────────────────────────────────────────────────
+  # 8. Barras (años válidos vs inválidos)
+  # ─────────────────────────────────────────────────────────────
+  if (mostrar_barras)
+    p <- p +
+      geom_col(aes(fill=anio_valido),alpha=.6,width=.8,
+               show.legend=mostrar_leyenda_barras) +
+      scale_fill_manual(
+        values=c("TRUE"=color_anio_valido,"FALSE"=color_anio_invalido),
+        labels=c("TRUE"="Dato válido","FALSE"="Año incompleto"),
+        name=NULL
+      )
+
+  # ─────────────────────────────────────────────────────────────
+  # 9. Línea de serie original (opcional)
+  # ─────────────────────────────────────────────────────────────
+  if (mostrar_linea)
+    p <- p +
+      geom_line(color=color_linea,linewidth=.6,alpha=.8)
+
+  # ─────────────────────────────────────────────────────────────
+  # 10. Cruces de años inválidos (opcional)
+  # ─────────────────────────────────────────────────────────────
+  if (mostrar_cruces_invalidos)
+    p <- p +
+      geom_point(data=dplyr::filter(df_completa,!anio_valido),
+                 aes(x=.data[[anio_col]],y=.data[[variable]]),
+                 color=color_anio_invalido,shape=4,size=2.5,
+                 inherit.aes=FALSE)
+
+  # ─────────────────────────────────────────────────────────────
+  # 11. Media móvil (suavizado)
+  # ─────────────────────────────────────────────────────────────
+  if (mostrar_media_movil)
+    p <- p +
+      geom_line(aes(y=media_movil), color=color_media_movil, linewidth=1.1,na.rm=TRUE,show.legend=FALSE)
+
+  # ─────────────────────────────────────────────────────────────
+  # 12. Líneas Sen (tendencias)
+  # ─────────────────────────────────────────────────────────────
+  p <- p +
+    geom_line(data=sen_all, aes(x=x,y=ysen,color=caso,linetype=caso),
+              linewidth=.95,inherit.aes=FALSE, show.legend=mostrar_leyenda_sen) +
+    scale_color_manual(values=setNames(c(color_sen_completa,color_sen_sinAbr,color_sen_sinAbrMay),lab),
+                       name=NULL) +
+    scale_linetype_manual(values=setNames(c("solid","dashed","dotdash"),lab), name=NULL)
+
+  # ─────────────────────────────────────────────────────────────
+  # 13. Etiquetas + tema
+  # ─────────────────────────────────────────────────────────────
+  p <- p +
+    labs(title=if(mostrar_titulo) nombre_variable else NULL, 
+         subtitle=if(mostrar_subtitulo) estacion else NULL, x=xlabel,y=ylab) +
+    theme_minimal() +
+    theme(
+      plot.title=element_text(hjust=.5,face="bold",size=11),
+      plot.subtitle=element_text(hjust=.5,size=9,color="grey40",face="italic"),
+      legend.position="bottom", legend.box="vertical", 
+      legend.spacing.y=unit(.2,"cm"), legend.text=element_text(size=8),
+      axis.title=element_text(size=9), axis.text=element_text(size=8),
+      panel.grid.minor=element_blank()
+    )
+
+  # ─────────────────────────────────────────────────────────────
+  # 14. Control de leyendas
+  # ─────────────────────────────────────────────────────────────
+  if (!mostrar_leyenda_barras) p <- p + guides(fill="none")
+  if (!mostrar_leyenda_sen) p <- p + guides(color="none",linetype="none")
+
+  p
+}
+```
+
+```{r graficas_sensibilidad, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=10, fig.align="center"}
+# ─────────────────────────────────────────────────────────────
+# Tamaño (precipitación)
+# ─────────────────────────────────────────────────────────────
+
+p1 <- plot_sensibilidad_sen(
+  intensidad_tama, metricas_tama_sinAbr, metricas_tama_sinAbrMay,
+  "total_prec", "Tama", tabla_sensibilidad,
+  color_anio_valido="skyblue2", color_anio_invalido="salmon",
+  color_linea="grey30", color_media_movil="navy",
+  mostrar_titulo=FALSE, mostrar_cruces_invalidos=FALSE,
+  mostrar_leyenda_barras=FALSE, mostrar_leyenda_sen=FALSE
+)
+
+p2 <- plot_sensibilidad_sen(
+  intensidad_santander, metricas_santander_sinAbr, metricas_santander_sinAbrMay,
+  "total_prec", "Santander", tabla_sensibilidad,
+  color_anio_valido="skyblue2", color_anio_invalido="salmon",
+  color_linea="grey30", color_media_movil="navy",
+  mostrar_titulo=FALSE, mostrar_cruces_invalidos=FALSE,
+  mostrar_leyenda_barras=TRUE, mostrar_leyenda_sen=FALSE
+)
+
+# ─────────────────────────────────────────────────────────────
+# Días de lluvia
+# ─────────────────────────────────────────────────────────────
+
+p3 <- plot_sensibilidad_sen(
+  intensidad_tama, metricas_tama_sinAbr, metricas_tama_sinAbrMay,
+  "dias_lluvia", "Tama", tabla_sensibilidad,
+  color_anio_valido="plum2", color_anio_invalido="plum4", color_media_movil="orchid4",
+  mostrar_barras=TRUE, mostrar_linea=FALSE, mostrar_unidad_y=FALSE,
+  mostrar_titulo=FALSE, mostrar_subtitulo=FALSE, mostrar_cruces_invalidos=FALSE,
+  mostrar_leyenda_barras=FALSE, mostrar_leyenda_sen=FALSE
+)
+
+p4 <- plot_sensibilidad_sen(
+  intensidad_santander, metricas_santander_sinAbr, metricas_santander_sinAbrMay,
+  "dias_lluvia", "Santander", tabla_sensibilidad,
+  color_anio_valido="plum2", color_anio_invalido="plum4", color_media_movil="orchid4",
+  mostrar_barras=TRUE, mostrar_linea=FALSE, mostrar_unidad_y=FALSE,
+  mostrar_titulo=FALSE, mostrar_subtitulo=FALSE, mostrar_cruces_invalidos=FALSE,
+  mostrar_leyenda_barras=TRUE, mostrar_leyenda_sen=FALSE
+)
+
+# ─────────────────────────────────────────────────────────────
+# Intensidad media
+# ─────────────────────────────────────────────────────────────
+
+p5 <- plot_sensibilidad_sen(
+  intensidad_tama, metricas_tama_sinAbr, metricas_tama_sinAbrMay,
+  "intensidad_media", "Tama", tabla_sensibilidad,
+  color_linea="seagreen", color_media_movil="seagreen2",
+  mostrar_barras=FALSE, mostrar_linea=TRUE, mostrar_media_movil=TRUE,
+  mostrar_titulo=FALSE, mostrar_subtitulo=FALSE,
+  mostrar_leyenda_barras=FALSE, mostrar_leyenda_sen=FALSE
+)
+
+p6 <- plot_sensibilidad_sen(
+  intensidad_santander, metricas_santander_sinAbr, metricas_santander_sinAbrMay,
+  "intensidad_media", "Santander", tabla_sensibilidad,
+  color_linea="seagreen", color_media_movil="seagreen2",
+  mostrar_barras=FALSE, mostrar_linea=TRUE, mostrar_media_movil=TRUE,
+  mostrar_titulo=FALSE, mostrar_subtitulo=FALSE,
+  mostrar_leyenda_barras=FALSE, mostrar_leyenda_sen=TRUE
+)
+
+# ─────────────────────────────────────────────────────────────
+# Panel final
+# ─────────────────────────────────────────────────────────────
+
+(p1 | p2) / (p3 | p4) / (p5 | p6) +
+  patchwork::plot_annotation(
+    title = "Análisis de sensibilidad — efecto de excluir meses de primavera",
+    caption = paste("Línea continua: serie completa", 
+                    "Línea discontinua: sin abril",
+                    "Línea punto-raya: sin abril y mayo", 
+                    "Banda: ±1 desviación estándar (ventana 5 años)",
+                    sep = " | "),
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                  plot.caption = element_text(hjust = 0.5, size = 8, color = "grey50")
+                  )
+    ) &
+  theme(legend.position = "none")
+```
+
+# Sección 8 - Distribución mensual y estacional de las precipitaciones
+## 8.1 - Tendencias mensuales
+`tabla_mk_mensual()` aplica el pipeline estadístico completo (autocorrelación, selección MK/TFPW, Sen y Pettitt) a la precipitación mensual acumulada de cada uno de los 12 meses del año, iterando con `map_dfr(1:12, ...)`.
+
+Los meses con menos de 10 observaciones se omiten. Los resultados se presentan en tablas formateadas con `add_header_above()` para Tama y Santander. Este análisis permite identificar en qué meses concretos la precipitación muestra tendencias significativas, más allá del análisis anual agregado.
+```{r tabla_mk_mensual, echo=TRUE, message=FALSE, warning=FALSE}
+# Tendencia mensual de precipitación (Mann-Kendall + Sen + Pettitt)
+tabla_mk_mensual <- function(df_raw, estacion_label = "") {
+
+  meses <- c("Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic")
+
+  # Agregación mensual de precipitación
+  df <- df_raw %>%
+    filter(!is.na(prec)) %>%
+    group_by(anio, mes) %>%
+    summarise(prec_mensual = sum(prec), .groups = "drop")
+
+  map_dfr(1:12, function(m) {
+
+    serie <- df %>% filter(mes == m) %>% arrange(anio)
+    vals  <- serie$prec_mensual
+    anios <- serie$anio
+
+    if (length(vals) < 10) return(NULL)
+
+    # Corrección por autocorrelación (TFPW vs estándar)
+    acf1 <- acf(vals, lag.max = 1, plot = FALSE)$acf[2]
+    tfpw <- abs(acf1) > 1.96 / sqrt(length(vals))
+
+    mk <- if (tfpw) tfpwmk(vals) else mk.test(vals)
+
+    tau  <- if (tfpw) unname(mk[grep("Tau", names(mk), ignore.case = TRUE)]) else unname(mk$estimates["tau"])
+    pval <- if (tfpw) unname(mk[grep("p.value|P.value", names(mk), ignore.case = TRUE)]) else mk$p.value
+
+    sen <- sens.slope(vals)
+    pt  <- pettitt.test(vals)
+    k   <- as.integer(pt$estimate[1])
+
+    tibble(
+      estacion = estacion_label,
+      mes = m,
+      mes_label = factor(meses[m], levels = meses),
+      metodo = ifelse(tfpw, "tfpw", "estandar"),
+      tau = round(tau, 3),
+      p_valor = round(pval, 4),
+      sen_slope = round(sen$estimates, 3),
+
+      signif = case_when(pval < 0.01 ~ "**", pval < 0.05 ~ "*", pval < 0.10 ~ ".", TRUE ~ ""),
+
+      K_anio = if (k <= length(anios)) anios[k] else NA,
+      p_pt = round(pt$p.value, 4),
+
+      signif_pt = case_when(pt$p.value < 0.01 ~ "**", pt$p.value < 0.05 ~ "*",
+                            pt$p.value < 0.10 ~ ".", TRUE ~ "")
+    )
+  })
+}
+
+mk_mensual_tama <- tabla_mk_mensual(datos_tama_sin_NA, "Tama")
+mk_mensual_santander <- tabla_mk_mensual(datos_santander_limpios, "Santander")
+
+# ─────────────────────────────────────────────────────────────
+# Tablas de tendencias mensuales (MK + Sen + Pettitt)
+# ─────────────────────────────────────────────────────────────
+
+cols <- c("Estación","Mes","Mes","Método","Tau","p-valor", "Pendiente","Signif.","Año cambio",
+          "p-valor Pettitt","Signif. Pettitt")
+dig <- c(NA,0,NA,NA,3,4,3,NA,0,4,NA)
+cabecera <- c(" "=3,"Mann-Kendall"=3,"Pendiente de Sen"=2,"Pettitt"=3)
+caption_txt <- paste("Resultados de tendencia mensual (Mann-Kendall y Sen) y cambios (Pettitt).",
+                     "Significancia: ** p<0,01; * p<0,05; . p<0,10.")
+
+mk_mensual_tama %>%
+  knitr::kable(col.names=cols, digits=dig, caption=caption_txt) %>%
+  add_header_above(cabecera) %>%
+  kableExtra::kable_styling(
+    bootstrap_options=c("striped","hover","condensed"),
+    full_width=FALSE, position="center"
+  )
+
+mk_mensual_santander %>%
+  knitr::kable(col.names=cols, digits=dig, caption=caption_txt) %>%
+  add_header_above(cabecera) %>%
+  kableExtra::kable_styling(
+    bootstrap_options=c("striped","hover","condensed"),
+    full_width=FALSE, position="center"
+  )
+```
+
+`plot_prec_mensual_mk()` visualiza los resultados en un panel de 12 facetas (4 columnas × 3 filas, escalas libres en y). Cada faceta muestra barras por periodo (dorado = histórico, verde = reciente), curva LOESS negra discontinua, línea de Sen en rojo anclada en la mediana del año y del valor de cada mes, y línea de Pettitt en azul discontinuo solo cuando es significativa. Se genera un panel independiente por estación meteorológica.
+```{r grafica_mensual_mk, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=8, fig.align="center"}
+# Gráfica mensual con tendencias (Mann-Kendall, Sen y Pettitt)
+plot_prec_mensual_mk <- function(df_raw, mk_mensual, estacion, corte_anio = 1995) {
+
+  meses <- c("Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic")
+
+  # Datos mensuales + periodo
+  df <- df_raw %>%
+    filter(!is.na(prec)) %>%
+    group_by(anio, mes) %>%
+    summarise(prec_mensual = sum(prec), .groups = "drop") %>%
+    mutate(periodo = ifelse(anio <= corte_anio, "Histórico", "Reciente"),
+           mes_label = factor(meses[mes], levels = meses))
+
+  # Líneas de tendencia Sen
+  sen_lines <- mk_mensual %>%
+    left_join(
+      df %>% group_by(mes_label) %>%
+        summarise(anio_med = median(anio), val_med = median(prec_mensual),
+                  anio_min = min(anio), anio_max = max(anio),
+                  .groups = "drop"),
+      by = "mes_label"
+    ) %>%
+    mutate(y_ini = val_med + sen_slope * (anio_min - anio_med),
+           y_fin = val_med + sen_slope * (anio_max - anio_med)
+    )
+
+  ggplot(df, aes(anio, prec_mensual)) +
+    geom_col(aes(fill = periodo), alpha = 0.7) +
+    geom_smooth(method = "loess", se = FALSE,
+                color = "black", linetype = "dashed", linewidth = 0.5) +
+    geom_segment(data = sen_lines, color = "firebrick", linewidth = 1,
+                 aes(x = anio_min, xend = anio_max, y = y_ini, yend = y_fin)
+    ) +
+    geom_vline(data = mk_mensual %>% filter(p_pt < 0.05), aes(xintercept = K_anio),
+               color = "blue", linetype = "dotdash"
+    ) +
+    scale_fill_manual(values = c("Histórico" = "goldenrod2", "Reciente" = "seagreen3"),
+                      name = NULL) +
+    facet_wrap(~mes_label, scales = "free_y", ncol = 4) +
+    labs(title = estacion, x = "Año", y = "Precipitación (mm)") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "bottom",
+      axis.text.x = element_text(size = 7, angle = 45, hjust = 1),
+      strip.text = element_text(face = "bold")
+    )
+}
+
+plot_prec_mensual_mk(datos_tama_sin_NA, mk_mensual_tama, "Tama")
+plot_prec_mensual_mk(datos_santander_limpios, mk_mensual_santander, "Santander")
+```
+
+## 8.2 - Tendencias estacionales
+`tabla_mk_estacional()` aplica el mismo pipeline estadístico a la precipitación estacional, definiendo las cuatro estaciones climáticas como _Invierno_ (dic-feb), _Primavera_ (mar-may), _Verano_ (jun-ago) y _Otoño_ (sep-nov). Diciembre se adscribe al año siguiente (`anio_estacional` = `anio` + 1) siguiendo la convención meteorológica habitual. Los resultados se presentan con `mostrar_mk_estacional()` en tablas separadas para Tama y Santander.
+```{r tabla_mk_estacional, echo=TRUE, message=FALSE, warning=FALSE}
+# Función para calcular tendencias estacionales con MK, Sen y Pettitt
+tabla_mk_estacional <- function(df_raw, estacion_label = "") {
+  
+  estaciones <- c("Invierno", "Primavera", "Verano", "Otoño")
+  
+  # Calcular precipitación por estación climática
+  df <- df_raw %>%
+    filter(!is.na(prec)) %>%
+    mutate(
+      estacion_clima = case_when(mes %in% c(12,1,2) ~ "Invierno", mes %in% c(3,4,5) ~ "Primavera",
+                                 mes %in% c(6,7,8) ~ "Verano", TRUE ~ "Otoño"
+      ),
+      anio_estacional = ifelse(mes == 12, anio + 1, anio)
+    ) %>%
+    group_by(anio_estacional, estacion_clima) %>%
+    summarise(prec_estacional = sum(prec), .groups = "drop")
+  
+  map_dfr(estaciones, function(est) {
+    
+    serie <- df %>% filter(estacion_clima == est) %>% arrange(anio_estacional)
+    vals <- serie$prec_estacional
+    anios <- serie$anio_estacional
+    
+    if (length(vals) < 10) return(NULL)
+    
+    # Selección automática MK con corrección por autocorrelación
+    acf1 <- acf(vals, lag.max = 1, plot = FALSE)$acf[2]
+    tfpw <- abs(acf1) > 1.96 / sqrt(length(vals))
+    
+    mk <- if(tfpw) tfpwmk(vals) else mk.test(vals)
+    
+    tau <- if(tfpw) unname(mk[grep("Tau", names(mk), ignore.case = TRUE)])
+           else unname(mk$estimates["tau"])
+    
+    pval <- if(tfpw) unname(mk[grep("p.value|P.value", names(mk), ignore.case = TRUE)])
+            else mk$p.value
+    
+    # Tendencia de Sen y cambio de Pettitt
+    sen <- sens.slope(vals)
+    pt <- pettitt.test(vals)
+    k <- as.integer(pt$estimate[1])
+    
+    tibble(
+      estacion_met = estacion_label,
+      estacion_clima = factor(est, levels = estaciones),
+      metodo = ifelse(tfpw, "tfpw", "estandar"),
+      tau = round(tau, 3),
+      p_valor = round(pval, 4),
+      sen_slope = round(sen$estimates, 3),
+      signif = case_when(pval < 0.01 ~ "**", pval < 0.05 ~ "*", pval < 0.10 ~ ".", TRUE ~ ""),
+      K_anio = ifelse(k <= length(anios), anios[k], NA),
+      p_pt = round(pt$p.value, 4),
+      signif_pt = case_when(pt$p.value < 0.01 ~ "**", pt$p.value < 0.05 ~ "*",
+                            pt$p.value < 0.10 ~ ".", TRUE ~ "")
+    )
+  })
+}
+
+mk_estacional_tama <- tabla_mk_estacional(datos_tama_sin_NA, "Tama")
+mk_estacional_santander <- tabla_mk_estacional(datos_santander_limpios, "Santander")
+```
+
+```{r tabla_mk_estacional_results, echo=FALSE, message=FALSE, warning=FALSE}
+# Función para mostrar resultados MK estacionales
+mostrar_mk_estacional <- function(tabla, titulo) {
+
+  tabla %>%
+    select(estacion_clima, metodo, tau, p_valor, sen_slope, signif, K_anio, p_pt, signif_pt) %>%
+    knitr::kable(
+      col.names = c("Estación", "Método MK", "Tau de Kendall", "p-valor (MK)", "Pendiente de Sen", 
+                    "Signif.", "Año de cambio", "p-valor (Pettitt)", "Signif."),
+      caption = titulo, digits = 3
+    ) %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                              full_width = FALSE)
+}
+
+# Tablas finales
+mostrar_mk_estacional(mk_estacional_tama, "Resultados de los contrastes de tendencia estacional en Tama")
+
+mostrar_mk_estacional(mk_estacional_santander, "Resultados de los contrastes de tendencia estacional en Santander")
+```
+
+`plot_prec_estacional_mk()` genera un panel de 4 facetas (2 columnas × 2 filas, una por estación climática) con barras por periodo, curva LOESS, línea de Sen en rojo y líneas de Pettitt significativas en azul discontinuo. Permite identificar qué estaciones del año concentran los cambios y comparar su magnitud entre invierno, primavera, verano y otoño.
+```{r grafica_estacional_mk, echo=TRUE, message=FALSE, warning=FALSE, fig.width=8, fig.height=6, fig.align="center"}
+# Gráfico estacional con tendencias (Sen) y cambios (Pettitt)
+plot_prec_estacional_mk <- function(df_raw, mk_estacional, estacion, corte_anio = 1995) {
+
+  estaciones_orden <- c("Invierno","Primavera","Verano","Otoño")
+
+  # Datos estacionales
+  df <- df_raw %>%
+    filter(!is.na(prec)) %>%
+    mutate(estacion_clima = case_when(mes %in% c(12,1,2) ~ "Invierno", mes %in% c(3,4,5)   ~ "Primavera",
+                                      mes %in% c(6,7,8) ~ "Verano", mes %in% c(9,10,11) ~ "Otoño"),
+      anio_estacional = ifelse(mes == 12, anio + 1, anio)
+    ) %>%
+    group_by(anio_estacional, estacion_clima) %>%
+    summarise(prec_estacional = sum(prec), .groups = "drop") %>%
+    mutate(periodo = ifelse(anio_estacional <= corte_anio, "Histórico", "Reciente"),
+           estacion_clima = factor(estacion_clima, levels = estaciones_orden)
+    )
+
+  # Líneas de tendencia Sen
+  sen_lines <- mk_estacional %>%
+    left_join(
+      df %>% group_by(estacion_clima) %>%
+        summarise(
+          anio_med = median(anio_estacional),
+          val_med  = median(prec_estacional),
+          anio_min = min(anio_estacional),
+          anio_max = max(anio_estacional),
+          .groups = "drop"
+        ),
+      by = "estacion_clima"
+    ) %>%
+    mutate(y_ini = val_med + sen_slope * (anio_min - anio_med),
+           y_fin = val_med + sen_slope * (anio_max - anio_med)
+           )
+
+  # Pettitt significativo
+  pettitt_sig <- mk_estacional %>%
+    filter(p_pt < 0.05, !is.na(K_anio))
+
+  # Gráfico base
+  p <- ggplot(df, aes(anio_estacional, prec_estacional)) +
+    geom_col(aes(fill = periodo), alpha = 0.7) +
+    geom_smooth(method = "loess", se = FALSE, linetype = "dashed", color = "black") +
+    geom_segment(data = sen_lines, aes(x = anio_min, xend = anio_max, y = y_ini, yend = y_fin),
+                 color = "firebrick", linewidth = 1, inherit.aes = FALSE) +
+    scale_fill_manual(values = c("Histórico" = "goldenrod2", "Reciente" = "seagreen3"), name = NULL) +
+    facet_wrap(~estacion_clima, scales = "free_y", ncol = 2) +
+    labs(title = estacion, x = "Año", y = "Precipitación (mm)") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(face = "bold")
+    )
+
+  # Añadir líneas de Pettitt si existen
+  if (nrow(pettitt_sig)) {
+    p <- p + geom_vline(
+      data = pettitt_sig,
+      aes(xintercept = K_anio),
+      color = "blue", linetype = "dotdash", linewidth = 0.8
+    )
+  }
+
+  p
+}
+
+# Aplicación
+plot_prec_estacional_mk(datos_tama_sin_NA, mk_estacional_tama, "Tama")
+plot_prec_estacional_mk(datos_santander_limpios, mk_estacional_santander, "Santander")
+```
+
+# Sección 9 - Índices de concentración, estacionalidad y centroide anual de precipitación
+## 9.1 - Tests PCI y SI
+`calcular_pci_si()` calcula dos índices anuales de la distribución mensual:
+
+- El PCI (Oliver, 1980) = 100 × Σ(Pᵢ²) / (ΣPᵢ)², que mide la concentración mensual (< 10 uniforme, 10-20 moderado, > 20 irregular)
+- El SI (Walsh y Lawler, 1981) = Σ|Pᵢ - R/12| / R, que mide la estacionalidad (de muy uniforme < 0.19 a extremadamente estacional ≥ 1.00).
+
+Solo se incluyen años con los 12 meses disponibles (`n_meses == 12`) para evitar que los meses faltantes distorsionen el denominador de los índices. Se aplica `test_mann_kendall()` a las cuatro series resultantes (PCI y SI de cada estación) y los resultados se presentan en `tabla_mk_indices`.
+```{r}
+# ─────────────────────────────────────────────────────────────
+# Cálculo del PCI y SI por año
+# ─────────────────────────────────────────────────────────────
+
+calcular_pci_si <- function(df_raw, estacion_label="") {
+
+  # ── 1. Precipitación mensual agregada por año-mes ───────────
+  df_mensual <- df_raw %>%
+    filter(!is.na(prec)) %>%
+    group_by(anio, mes) %>%
+    summarise(prec_mensual=sum(prec,na.rm=TRUE), .groups="drop")
+
+  # ── 2. Filtrar años completos (solo con 12 meses) ────────────
+  anios_completos <- df_mensual %>%
+    group_by(anio) %>%
+    summarise(n_meses=n(), .groups="drop") %>%
+    filter(n_meses==12) %>%
+    pull(anio)
+
+  df_mensual <- df_mensual %>%
+    filter(anio %in% anios_completos)
+
+  # ── 3. Cálculo de índices PCI y SI ───────────────────────────
+  df_mensual %>%
+    group_by(anio) %>%
+    summarise(
+      # PCI: índice de concentración de precipitación
+      # <10 uniforme | 10–20 moderado | >20 irregular
+      PCI=100*sum(prec_mensual^2)/sum(prec_mensual)^2,
+
+      # SI: índice de estacionalidad (Walsh & Lawler)
+      # <0.19 muy uniforme | >1 extremadamente estacional
+      R=sum(prec_mensual),
+      SI=sum(abs(prec_mensual-R/12))/R,
+
+      .groups="drop"
+    ) %>%
+    select(-R) %>%
+    mutate(estacion=estacion_label)
+}
+
+# ─────────────────────────────────────────────────────────────
+# Aplicación a estaciones
+# ─────────────────────────────────────────────────────────────
+
+pci_si_tama <- calcular_pci_si(datos_tama_sin_NA, "Tama")
+pci_si_santander <- calcular_pci_si(datos_santander_limpios, "Santander")
+```
+
+```{r}
+# Tests de tendencia sobre PCI y SI
+tabla_mk_indices <- bind_rows(test_mann_kendall(pci_si_tama, PCI, "Tama - PCI"),  # PCI
+                              test_mann_kendall(pci_si_santander, PCI, "Santander - PCI"),
+                              test_mann_kendall(pci_si_tama, SI,  "Tama - SI"),   # SI
+                              test_mann_kendall(pci_si_santander, SI, "Santander - SI")
+                              )
+
+tabla_mk_indices %>%
+  
+  # ─────────────────────────────────────────────────────────────
+  # 1. Clasificación de estación e índice desde la variable "serie"
+  # ─────────────────────────────────────────────────────────────
+  mutate(
+    estacion = case_when(grepl("Tama", serie) ~ "Tama", grepl("Santander", serie) ~ "Santander"),
+    indice = case_when(grepl("PCI", serie) ~ "PCI", grepl("SI", serie) ~ "SI"),
+    estacion = factor(estacion, levels=c("Tama","Santander")),
+    indice = factor(indice, levels=c("PCI","SI"))
+  ) %>%
+  
+  # ─────────────────────────────────────────────────────────────
+  # 2. Orden final de la tabla
+  # ─────────────────────────────────────────────────────────────
+  arrange(estacion, indice) %>%
+  
+  # ─────────────────────────────────────────────────────────────
+  # 3. Selección de columnas finales
+  # ─────────────────────────────────────────────────────────────
+  select(estacion, indice, metodo, acf_lag1, tau, p_valor_mk, sen_slope, sen_inf, 
+         sen_sup, interpretacion, signif_mk, K_anio, p_valor_pt, signif_pt
+  ) %>%
+  
+  # ─────────────────────────────────────────────────────────────
+  # 4. Tabla formateada (kable)
+  # ─────────────────────────────────────────────────────────────
+  knitr::kable(
+    col.names=c("Estación","Índice","Método MK", "ACF lag-1","Tau","p-valor MK", 
+                "Pendiente Sen", "IC 95% inf.","IC 95% sup.", "Tendencia","Sig. MK", 
+                "Año cambio","p-valor Pettitt", "Sig. Pettitt"),
+    digits=c(NA,NA,NA, 3,4,4,4,4,4, NA,NA, 0,4,NA),
+    caption=paste("Tendencias de los índices de concentración de precipitación (PCI) y estacionalidad (SI) mediante Mann-Kendall, Sen y Pettitt.")
+  ) %>%
+  
+  # ─────────────────────────────────────────────────────────────
+  # 5. Estilo visual de la tabla
+  # ─────────────────────────────────────────────────────────────
+  kableExtra::kable_styling(
+    bootstrap_options=c("striped","hover","condensed"),
+    full_width=FALSE,
+    position="center"
+  )
+```
+
+`plot_indice()` visualiza cualquier índice anual con línea de puntos, curva LOESS discontinua, línea de Sen en rojo y, condicionalmente, el punto de cambio de Pettitt en naranja. La función `añadir_umbrales_si()` superpone las cuatro líneas de referencia horizontales de la clasificación de Walsh y Lawler (0.20, 0.40, 0.60 y 0.80). Los gráficos del PCI se enriquecen manualmente con los umbrales en 10 y 20 mediante anotaciones directas.
+```{r grafica_PCI_SI, echo=TRUE, message=FALSE, warning=FALSE, fig.width=14, fig.height=6, fig.align="center"}
+# ─────────────────────────────────────────────────────────────
+# Función general de gráficos (PCI / SI)
+# ─────────────────────────────────────────────────────────────
+plot_indice <- function(df, variable, estacion, tabla_mk, serie_label, color_linea="steelblue", 
+                        ylab="", linea_ref=NULL, label_ref=NULL) {
+
+  # ── Datos MK y estadísticos base ────────────────────────────
+  mk_row <- tabla_mk %>% filter(serie==serie_label)
+
+  vals  <- df[[variable]]
+  anios <- df$anio
+
+  anio_med <- median(anios)
+  val_med  <- median(vals, na.rm=TRUE)
+
+  slope   <- mk_row$sen_slope
+  sig_mk  <- mk_row$signif_mk
+
+  sen_df <- tibble(x=c(min(anios),max(anios)), 
+                   ysen=val_med + slope*(c(min(anios),max(anios))-anio_med)
+                   )
+
+  # ── Etiqueta Sen (no usada en plot, pero mantenida) ─────────
+  sen_lab <- paste0("Sen: ",sprintf("%+.4f",slope),"/año ",sig_mk)
+
+  # ── Gráfico base ────────────────────────────────────────────
+  p <- ggplot(df,aes(x=anio,y=.data[[variable]])) +
+    geom_line(color=color_linea,linewidth=.6,alpha=.7) +
+    geom_point(color=color_linea,size=1.5,alpha=.6) +
+    geom_smooth(method="loess",se=FALSE, color="black",linetype="dashed",linewidth=.7) +
+    geom_line(data=sen_df,aes(x=x,y=ysen), color="firebrick",linewidth=1,inherit.aes=FALSE) +
+    labs(title=paste(variable,"-",estacion), x="Año", y=ylab) +
+    theme_minimal() +
+    theme(plot.title=element_text(hjust=.5,face="bold"))
+
+  # ── Línea de referencia opcional ────────────────────────────
+  if (!is.null(linea_ref)) {
+    p <- p +
+      geom_hline(yintercept=linea_ref,color="grey50", linetype="dotted",linewidth=.6) +
+      annotate("text",x=min(anios),y=linea_ref, label=label_ref,hjust=0,vjust=-0.4, size=2.8,color="grey40")
+  }
+
+  # ── Cambio estructural Pettitt ──────────────────────────────
+  k_anio <- mk_row$K_anio
+
+  if (!is.na(k_anio) && mk_row$p_valor_pt < 0.05) {
+    p <- p +
+      geom_vline(xintercept=k_anio,color="darkorange", linetype="dotdash",linewidth=.8) +
+      annotate("text", x=k_anio+0.5, y=max(vals,na.rm=TRUE)*0.95,
+               label=paste0("Cambio: ",k_anio," ",mk_row$signif_pt), hjust=0,size=2.8,color="darkorange")
+  }
+
+  p
+}
+
+# ─────────────────────────────────────────────────────────────
+# Función auxiliar: umbrales SI
+# ─────────────────────────────────────────────────────────────
+añadir_umbrales_si <- function(p) {
+
+  umbrales <- c(0.20,0.40,0.60,0.80)
+  etiquetas <- c("0.20 — uniforme con estación húmeda", "0.40 — bastante estacional",
+                 "0.60 — estacional","0.80 — muy estacional")
+
+  for (i in seq_along(umbrales)) {
+    p <- p +
+      geom_hline(yintercept=umbrales[i],color="grey60", linetype="dotted",linewidth=.5) +
+      annotate("text",x=-Inf,y=umbrales[i], label=etiquetas[i], 
+               hjust=-0.03,vjust=-0.4, size=2.5,color="grey45")
+  }
+
+  p
+}
+```
+
+## 9.2 - Centroide
+`calcular_centroide()` calcula el día del año en que se ha acumulado el 50% de la precipitación anual total, ordenando los días de cada año por posición calendaria (`dia_anio`, de 1 a 365/366) y localizando el primer día en que la acumulación supera el umbral del 50%. Se excluyen los años con menos de 330 días con dato para evitar que los huecos sesguen el centroide hacia los meses con más registros disponibles.
+
+Se aplica `test_mann_kendall()` a las series de centroide de ambas estaciones. Los resultados se presentan en una tabla con `kableExtra`, incluyendo el IC 95% de la pendiente de Sen. Los gráficos `p_cent_tama` y `p_cent_sant` usan `plot_indice()` con una línea de referencia en el día 182 (1 de julio), que divide el año calendario en dos mitades equivalentes.
+```{r calculo_centroide, echo=TRUE, message=FALSE, warning=FALSE}
+# ─────────────────────────────────────────────────────────────
+# Centroide de precipitación anual
+# (día del año en que se alcanza el 50% de la precipitación)
+# ─────────────────────────────────────────────────────────────
+
+calcular_centroide <- function(df_raw, estacion_label="") {
+
+  # ── 1. Preparación de datos (orden temporal + día del año) ───
+  df <- df_raw %>%
+    filter(!is.na(prec)) %>%
+    arrange(anio, mes, dia) %>%
+    mutate(fecha = as.Date(paste(anio,mes,dia,sep="-")),
+           dia_anio = as.integer(format(fecha,"%j"))
+           )
+
+  # ── 2. Cálculo anual del centroide ───────────────────────────
+  df %>%
+    group_by(anio) %>%
+    summarise(prec_total  = sum(prec,na.rm=TRUE), n_dias_dato = sum(!is.na(prec)),
+
+      # Centroide: día en que se alcanza el 50% acumulado
+      Centroide = {
+        ord <- order(dia_anio)
+        prec_ord <- prec[ord]
+        dias_ord <- dia_anio[ord]
+
+        umbral <- sum(prec_ord) * 0.5
+        idx <- which(cumsum(prec_ord) >= umbral)[1]
+
+        if (!is.na(idx)) dias_ord[idx] else NA_real_
+      },
+
+      .groups="drop"
+    ) %>%
+
+    # ── 3. Filtrado de años con datos suficientes ─────────────
+    filter(n_dias_dato >= 330) %>%
+    mutate(estacion=estacion_label)
+}
+
+# ─────────────────────────────────────────────────────────────
+# Aplicación a estaciones
+# ─────────────────────────────────────────────────────────────
+
+centroide_tama      <- calcular_centroide(datos_tama_sin_NA, "Tama")
+centroide_santander <- calcular_centroide(datos_santander_limpios, "Santander")
+```
+
+```{r}
+# ─────────────────────────────────────────────────────────────
+# Tendencia del centroide de precipitación
+# ─────────────────────────────────────────────────────────────
+
+tabla_mk_centroide <- bind_rows(test_mann_kendall(centroide_tama, Centroide, "Tama - Centroide"),
+                                test_mann_kendall(centroide_santander, Centroide, "Santander - Centroide"))
+
+tabla_mk_centroide %>%
+  mutate(
+    estacion = factor(
+      case_when(grepl("Tama", serie) ~ "Tama", grepl("Santander", serie) ~ "Santander"),
+      levels = c("Tama", "Santander")
+    ),
+    indicador = "Centroide de precipitación"
+  ) %>%
+  arrange(estacion) %>%
+  select(estacion, indicador, metodo, acf_lag1, tau, p_valor_mk, sen_slope, sen_inf, sen_sup,
+         interpretacion, signif_mk, K_anio, p_valor_pt, signif_pt
+  ) %>%
+  knitr::kable(
+    col.names = c("Estación","Indicador","Método MK","ACF lag-1","Tau","p-valor MK", "Pendiente Sen",
+                  "IC 95% inf.","IC 95% sup.","Tendencia","Sig. MK", "Año cambio","p-valor Pettitt",
+                  "Sig. Pettitt"),
+    digits = c(NA,NA,NA,3,4,4,4,4,4,NA,NA,0,4,NA),
+    caption = paste(
+      "Tendencia temporal del centroide de precipitación anual.",
+      "El centroide representa el día del año en que se acumula el 50% de la precipitación anual."
+    )
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+El panel final `(p_pci_tama | p_pci_sant) / (p_si_tama | p_si_sant) / (p_cent_tama | p_cent_sant)` reúne los seis gráficos de los tres índices para una lectura conjunta de la concentración, estacionalidad y distribución temporal de la precipitación en Cantabria.
+```{r grafica_tres_indices, echo=TRUE, message=FALSE, warning=FALSE, fig.width=14, fig.height=10, fig.align="center"}
+# ─────────────────────────────────────────────────────────────
+# PCI: Tama y Santander
+# ─────────────────────────────────────────────────────────────
+p_pci_tama <- plot_indice(pci_si_tama,"PCI","Tama", tabla_mk_indices,"Tama - PCI",
+                          color_linea="steelblue", ylab="PCI") +
+  geom_hline(yintercept=c(10,20),color="grey60",linetype="dotted") +
+  annotate("text",x=-Inf,y=10,label="10 (uniforme/moderado)",
+           hjust=-0.05,vjust=-0.4,size=2.8,color="grey50") +
+  annotate("text",x=-Inf,y=20,label="20 (moderado/irregular)",
+           hjust=-0.05,vjust=-0.4,size=2.8,color="grey50")
+
+p_pci_sant <- plot_indice(pci_si_santander,"PCI","Santander", tabla_mk_indices,"Santander - PCI",
+                          color_linea="steelblue", ylab="PCI") +
+  geom_hline(yintercept=c(10,20),color="grey60",linetype="dotted") +
+  annotate("text",x=-Inf,y=10,label="10 (uniforme/moderado)",
+           hjust=-0.05,vjust=-0.4,size=2.8,color="grey50") +
+  annotate("text",x=-Inf,y=20,label="20 (moderado/irregular)",
+           hjust=-0.05,vjust=-0.4,size=2.8,color="grey50")
+
+# ─────────────────────────────────────────────────────────────
+# SI: Tama y Santander
+# ─────────────────────────────────────────────────────────────
+
+p_si_tama <- plot_indice(pci_si_tama,"SI","Tama", tabla_mk_indices,"Tama - SI",
+                         color_linea="darkgreen", ylab="SI") %>%
+  añadir_umbrales_si()
+
+p_si_sant <- plot_indice(pci_si_santander,"SI","Santander", tabla_mk_indices,"Santander - SI",
+                         color_linea="darkgreen", ylab="SI") %>%
+  añadir_umbrales_si()
+
+# ─────────────────────────────────────────────────────────────
+# Gráfica del centroide de precipitación
+# Referencias: 182 ≈ 1 de julio (punto medio del año hidrológico)
+# ─────────────────────────────────────────────────────────────
+
+p_cent_tama <- plot_indice(centroide_tama, "Centroide", "Tama", 
+                           tabla_mk_centroide, "Tama - Centroide",
+                           color_linea="purple4", ylab="Día del año", 
+                           linea_ref=182, label_ref="1 de julio")
+
+p_cent_sant <- plot_indice(centroide_santander, "Centroide", "Santander", 
+                           tabla_mk_centroide, "Santander - Centroide",
+                           color_linea="purple4", ylab="Día del año",
+                           linea_ref=182, label_ref="1 de julio")
+
+# Representar en una sola grafica PCI, SI y centroide
+(p_pci_tama | p_pci_sant) / (p_si_tama | p_si_sant) / (p_cent_tama | p_cent_sant) +
+  plot_annotation(
+    title = "Índices de concentración, estacionalidad y centroide de precipitación",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  )
+```
