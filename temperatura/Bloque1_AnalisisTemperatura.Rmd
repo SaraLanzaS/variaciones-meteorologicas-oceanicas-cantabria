@@ -1,0 +1,598 @@
+---
+title: "Análisis de extremos térmicos en Cantabria: tendencias y contraste de estacionariedad"
+subtitle: Bloque 1 del TFM *Estudio estadístico de variaciones meteorológicas y oceánicas en Cantabria*"
+author: "Sara Lanza Sarabia"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Bloque de carga de librerías
+ Cargamos las librerías necesarias para el análisis y visualización de datos:
+ 
+ - *ggplot2*: generación de gráficos
+ - *dplyr*: manipulación y transformación de dataframes
+ - *readr*: lectura eficiente de archivos CSV
+ - *patchwork*: composición de múltiples gráficos en un único panel
+ - *kableExtra*: creación de tablas con formato en R Markdown
+```{r cargas_librerias, message=FALSE, warning=FALSE}
+# Cargamos las librerías necesarias para el análisis y visualización de datos
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(patchwork)
+```
+
+## Bloque de carga de datos
+ Cargamos los datos de las dos estaciones meteorológicas seleccionadas para el análisis:
+ 
+ - `datos_tama`: serie diaria de la estación de Tama (1972-2025), ubicada en el Valle de Liébana a 893 m de altitud, representativa del clima interior de Cantabria.
+ - `datos_santander`: serie diaria de Santander (1961-2025), resultado de la fusión de los registros históricos del Instituto Oceanográfico (1961-1977) y los datos de la AEMET (1978-2025), representativa del litoral cantábrico.
+ 
+ Ambos datasets contienen, entre otras variables, las columnas `tmax` (temperatura máxima diaria) y `tmin` (temperatura mínima diaria), además de las variables de fecha `anio`, `mes` y `dia`.
+```{r cargar_datos, message=FALSE, warning=FALSE}
+# Cargamos los datos de las dos estaciones meteorológicas
+datos_tama <- read_csv("datosDiariosMeteo_tama_1972_to_2025.csv")
+datos_santander <- read_csv("datosDiariosMeteo_santander_1961_to_2025.csv")
+```
+
+# Sección 1 — Curación  de datos
+La función `limpiar_datos()` prepara cada dataset para el análisis eliminando las columnas que no son necesarias (`indicativo`, `provincia`, `fecha`, `horatmin`, `horatmax`, `hrMedia`, `racha`, `horaracha` y `dir`), convirtiendo las temperaturas `tmax` y `tmin` a formato numérico con punto decimal (los datos de la AEMET usan coma como separador decimal), y garantizando que las variables de fecha `anio`, `mes` y `dia` sean numéricas.
+
+Finalmente, devuelve el dataframe limpio con las columnas relevantes para el análisis posterior.
+```{r funcion_limpiar_datos, message=FALSE, warning=FALSE}
+# Función para limpiar los datos meteorológicos
+limpiar_datos <- function(df) {
+  
+  # Eliminar columnas que no se utilizarán en el análisis
+  df <- df[, !(names(df) %in% c("indicativo", "provincia", "fecha", "horatmin", 
+                                "horatmax", "hrMedia", "racha", "horaracha", "dir"))]
+  
+  # Convertir tmax y tmin a numérico (reemplazando comas por puntos)
+  df$tmax <- as.numeric(gsub(",", ".", df$tmax))
+  df$tmin <- as.numeric(gsub(",", ".", df$tmin))
+  
+  # Convertir variables de fecha a formato numérico
+  df$anio <- as.numeric(df$anio)
+  df$mes <- as.numeric(df$mes)
+  df$dia <- as.numeric(df$dia)
+  
+  # Devolver el dataframe limpio
+  return(df)
+}
+```
+
+La función `correccion_NA()` imputa los valores `NA` aislados en las columnas de temperatura máxima (`tmax`) y mínima (`tmin`). Para cada posición `NA`, comprueba si existe un valor válido en el día anterior y en el día siguiente; si ambos están disponibles, imputa la media de los dos. Si el `NA` no está aislado — es decir, forma parte de un bloque de dos o más `NAs` consecutivos — se conserva como `NA` y la fila correspondiente es eliminada al final de la función.
+
+Esta estrategia es adecuada porque las series de temperatura diaria son suaves y los `NA` en estos datasets aparecen dispersos y de forma aislada, sin formar grandes bloques. Si existieran bloques extensos de `NA`, sería necesario recurrir a métodos más sofisticados como interpolación spline o modelos de series temporales.
+
+La función trabaja sobre copias de los vectores `tmax` y `tmin` (`tmax_copia` y `tmin_copia`) para evitar que los valores ya imputados influyan en la imputación de posiciones adyacentes. Devuelve el dataframe con los `NA` aislados corregidos y las filas con `NA` persistentes eliminadas.
+```{r funcion_correccion_NA, message=FALSE, warning=FALSE}
+# Función para corregir valores NA en tmax y tmin
+# Se imputan usando la media de los días anterior y posterior.
+# Si el NA está al inicio o al final del dataset, se usa el valor disponible más cercano.
+
+correccion_NA <- function(df) {
+  
+  df <- df %>%
+    arrange(anio, mes, dia)  # Asegurar orden temporal
+  
+  n <- nrow(df)
+  
+  # Crear copias para no sobrescribir mientras iteramos
+  tmax_copia <- df$tmax
+  tmin_copia <- df$tmin
+  
+  for (i in 1:n) {
+    
+    # =========================
+    # tmax
+    # =========================
+    if (is.na(df$tmax[i])) {
+      
+      # Comprobar vecinos
+      prev_val <- if (i > 1) df$tmax[i - 1] else NA
+      next_val <- if (i < n) df$tmax[i + 1] else NA
+      
+      # SOLO imputar si ambos vecinos existen (NA aislado)
+      if (!is.na(prev_val) & !is.na(next_val)) {
+        tmax_copia[i] <- mean(c(prev_val, next_val))
+      }
+      # Si no → se queda como NA (bloque)
+    }
+    
+    # =========================
+    # tmin
+    # =========================
+    if (is.na(df$tmin[i])) {
+      
+      prev_val <- if (i > 1) df$tmin[i - 1] else NA
+      next_val <- if (i < n) df$tmin[i + 1] else NA
+      
+      if (!is.na(prev_val) & !is.na(next_val)) {
+        tmin_copia[i] <- mean(c(prev_val, next_val))
+      }
+    }
+  }
+  
+  # Reemplazar columnas
+  df$tmax <- tmax_copia
+  df$tmin <- tmin_copia
+  
+  # Eliminas filas que siguen teniendo NA en tmax o tmin (bloques no imputados)
+  df <- df %>% filter(!is.na(tmax) & !is.na(tmin))
+  
+  return(df)
+}
+```
+
+Aplicamos las dos funciones de preprocesamiento a cada dataset:
+
+1. `limpiar_datos()` elimina las columnas no necesarias, convierte las temperaturas a numérico y homogeneiza el formato de las variables de fecha.
+2. `correccion_NA()` imputa los `NA` aislados en `tmax` y `tmin` mediante la media de los días adyacentes, y elimina las filas con bloques de `NA` no imputables.
+
+El filtro final filter(`!is.na(tmax) & !is.na(tmin)`) actúa como salvaguarda para garantizar que no queden registros con `NA` en las variables de temperatura antes de comenzar el análisis de extremos.
+```{r limpiar_datos_estaciones, message=FALSE, warning=FALSE}
+# Limpiar los datos de cada estación utilizando la función definida anteriormente
+datos_tama <- limpiar_datos(datos_tama)
+datos_santander <- limpiar_datos(datos_santander)
+
+# Corregir los valores NA en las columnas de temperatura para cada estación
+datos_tama <- correccion_NA(datos_tama)
+datos_santander <- correccion_NA(datos_santander)
+
+# Eliminar las filas con NA en tmax o tmin para evitar problemas en el análisis posterior
+datos_tama <- datos_tama %>% filter(!is.na(tmax) & !is.na(tmin))
+datos_santander <- datos_santander %>% filter(!is.na(tmax) & !is.na(tmin))
+```
+
+# Sección 2 - Calculo de extremos térmicos
+La función `calcular_extremos()` identifica los días de temperatura extrema en una serie diaria. Recibe cuatro argumentos:
+
+ - *df*: el dataframe limpio con los datos de temperatura.
+ - *variable*: la columna a analizar; *"tmax"* para calor extremo o *"tmin"* para frío extremo.
+ - *prob*: el percentil de referencia; 0.95 para calor extremo (días en el 5% superior de la distribución) o 0.05 para frío extremo (días en el 5% inferior).
+ - *tipo*: *"mayor"* para filtrar valores por encima del percentil (calor) o *"menor"* para filtrar valores por debajo del percentil (frío).
+
+Calcula el percentil global sobre toda la serie histórica disponible y devuelve únicamente los registros que superan (o quedan por debajo de) ese umbral.
+
+Por construcción estadística, aproximadamente el 5% de los días de cada serie pertenece a cada categoría de extremo.
+```{r message=FALSE, warning=FALSE}
+# Función para identificar valores extremos de una variable usando percentiles
+calcular_extremos <- function(df, variable, prob, tipo = "mayor") {
+  
+  # Calcular el percentil global de la variable
+  percentil <- quantile(df[[variable]], probs = prob, na.rm = TRUE)
+  
+  # Filtrar observaciones extremas según el tipo especificado
+  if (tipo == "mayor") {
+    # Valores mayores que el percentil (extremos superiores)
+    extremos <- df %>% filter(.data[[variable]] > percentil)
+  } else {
+    # Valores menores que el percentil (extremos inferiores)
+    extremos <- df %>% filter(.data[[variable]] < percentil)
+  }
+  
+  # Devolver dataframe con los valores extremos
+  return(extremos)
+}
+```
+
+Aplicamos `calcular_extremos()` a cada estación para obtener los subconjuntos de días que superan los umbrales de extremo térmico:
+
+ - `dias_calor_tama` / `dias_calor_santander`: días con `tmax` superior al percentil 95 de la serie completa de cada estación (calor extremo).
+ - `dias_frio_tama` / `dias_frio_santander`: días con `tmin` inferior al percentil 5 de la serie completa de cada estación (frío extremo).
+
+Cada uno de estos dataframes conserva todas las columnas del dataset limpio, incluyendo `anio`, `mes` y `dia`, lo que permitirá analizar la distribución temporal de los eventos extremos en los pasos siguientes.
+```{r message=FALSE, warning=FALSE}
+# Calculon de días de calor extremo (tmax > percentil 95) para cada estación
+dias_calor_tama <- calcular_extremos(datos_tama, "tmax", 0.95, "mayor")
+dias_calor_santander <- calcular_extremos(datos_santander, "tmax", 0.95, "mayor")
+
+# Calculon de días de frío extremo (tmin < percentil 5) para cada estación
+dias_frio_tama <- calcular_extremos(datos_tama, "tmin", 0.05, "menor")
+dias_frio_santander <- calcular_extremos(datos_santander, "tmin", 0.05, "menor")
+```
+
+La función `conteo_anual()` transforma los datasets de días extremos en series temporales anuales. Agrupa los registros por año (`anio`), cuenta el número de días extremos en cada año mediante `n()`, y añade una columna `"tipo"` con la etiqueta del evento (por ejemplo, *"Calor Extremo"* o *"Frío Extremo"*). El resultado es un dataframe con una fila por año que indica cuántos días extremos de ese tipo se registraron en dicho año, listo para su representación gráfica y análisis de tendencias.
+```{r message=FALSE, warning=FALSE}
+# Función para contar el número de días extremos por año
+conteo_anual <- function(df, etiqueta) {
+  
+  # Agrupar los datos por año
+  df %>%
+    # Contar cuántos registros (días) hay en cada año
+    group_by(anio) %>%
+    summarise(dias = n()) %>%
+    # Añadir una columna que indique el tipo de evento (calor o frío)
+    mutate(tipo = etiqueta)
+}
+```
+
+Aplicamos `conteo_anual()` a cada dataset de días extremos para obtener el número de eventos por año y por estación. A continuación combinamos los conteos de calor y frío en un único dataframe por estación mediante `bind_rows()`:
+
+ - `conteo_total_tama`: conteo anual de días de calor extremo y frío extremo en Tama.
+ - `conteo_total_santander`: ídem para Santander.
+
+Esta estructura unificada, con la columna `"tipo"` diferenciando ambos extremos, facilita la representación conjunta en un único gráfico y el posterior análisis por quinquenios.
+```{r message=FALSE, warning=FALSE}
+# Contar días de calor extremo por año
+calor_anual_tama <- conteo_anual(dias_calor_tama, "Calor Extremo")
+calor_anual_santander <- conteo_anual(dias_calor_santander, "Calor Extremo")
+
+# Contar días de frío extremo por año
+frio_anual_tama <- conteo_anual(dias_frio_tama, "Frío Extremo")
+frio_anual_santander <- conteo_anual(dias_frio_santander, "Frío Extremo")
+
+# Combinar los conteos de calor y frío extremo en un único dataframe
+conteo_total_tama <- bind_rows(calor_anual_tama, frio_anual_tama)
+conteo_total_santander <- bind_rows(calor_anual_santander, frio_anual_santander)
+```
+
+# Sección 3 - Graficar la evolución anual de los días de calor y frío extremo
+La función `grafico_extremos()` representa la evolución anual del número de días de calor extremo y frío extremo para una estación. Recibe el dataframe combinado (con la columna `"tipo"` diferenciando ambos extremos), el título del gráfico, y un parámetro opcional mostrar_leyenda que controla si se muestra la leyenda (desactivada en el panel superior para evitar duplicidad cuando los gráficos se combinan con patchwork).
+
+El gráfico incluye puntos por año (`geom_point`), líneas que conectan los valores anuales (`geom_line`) y una curva suavizada LOESS (`geom_smooth`) que muestra la tendencia general a largo plazo. El calor extremo se representa en naranja y el frío extremo en azul celeste. El eje *x* corresponde al año y el eje *y* al número de días extremos registrados en cada año.
+```{r message=FALSE, warning=FALSE, fig.width=15, fig.height=5}
+# Función para representar gráficamente la evolución anual de extremos térmicos por tipo (calor y frío)
+grafico_extremos <- function(df, titulo, mostrar_leyenda = TRUE) {
+  
+  # Crear gráfico de días extremos por año diferenciando calor y frío
+p <- ggplot(df, aes(x = anio, y = dias, color = tipo)) +
+     geom_point(alpha = 0.6) + # Puntos para cada observación anual
+     geom_line(alpha = 0.4) + # Líneas que conectan los puntos
+     geom_smooth(se = FALSE, size = 1.5) + # Línea suavizada que muestra la tendencia general
+    
+     # Etiquetas del gráfico
+     labs(title = titulo, x = "Año", y = "Número de días", color = "Tipo de extremo: ") +
+     # Colores personalizados para cada tipo de extremo
+     scale_color_manual(values = c("Calor Extremo" = "orange", "Frío Extremo" = "deepskyblue")) +
+     theme_minimal() +
+     theme(legend.position = "bottom", legend.direction = "horizontal")
+  
+  if (!mostrar_leyenda) {
+    p <- p + theme(legend.position = "none")
+  }
+  
+  return(p)
+}
+```
+
+Generamos los gráficos de evolución anual para cada estación y los componemos en un panel vertical con patchwork (operador /):
+
+ - `grafica_tama`: evolución de los extremos térmicos en Tama (sin leyenda, ya que se muestra en el gráfico inferior).
+ - `grafica_santander`: ídem para Santander (con leyenda compartida al pie).
+ 
+El panel combinado permite comparar visualmente la tendencia ascendente de los días de calor extremo y la tendencia descendente de los días de frío extremo en ambas estaciones a lo largo de sus respectivas series históricas.
+```{r, message=FALSE, warning=FALSE, fig.width=15, fig.height=8, fig.align='center'}
+# Aplicar la función de graficado a cada estación
+grafica_tama <- grafico_extremos(conteo_total_tama, "Extremos térmicos en Tama", mostrar_leyenda = FALSE)
+grafica_santander <- grafico_extremos(conteo_total_santander, "Extremos térmicos en Santander")
+
+# Mostrar gráficos
+grafica_tama / grafica_santander
+```
+
+# Sección 4 - Agrupación de los datos por quinquenios
+Para suavizar la variabilidad interanual y facilitar la comparación entre periodos amplios, agrupamos los datos en quinquenios (intervalos de 5 años: 1970-1974, 1975-1979, etc.). La función `asignar_quinquenio()` añade una columna *"quinquenio"* a cada dataframe, calculada como el producto del cociente `floor(anio / 5) * 5` (que da el año de inicio del intervalo) formateado como cadena de texto del tipo *"1970-1974"*. Esta agrupación permite observar tendencias a largo plazo eliminando el ruido de las fluctuaciones año a año.
+```{r message=FALSE, warning=FALSE}
+# Función para asignar a cada registro el quinquenio correspondiente
+# (periodos de 5 años: 1990-1994, 1995-1999, etc.)
+asignar_quinquenio <- function(df) {
+  df %>%
+    mutate(quinquenio = paste0(floor(anio / 5) * 5, "-", floor(anio / 5) * 5 + 4))
+}
+```
+
+Añadimos la columna "quinquenio" a los dataframes de conteos anuales de cada estación. Este paso modifica `conteo_total_tama` y `conteo_total_santander` en su lugar, preparándolos para la agregación por quinquenio en el paso siguiente.
+```{r message=FALSE, warning=FALSE}
+# Agrupar por quinquenios y tipo (calor/frio) para cada estación
+conteo_total_tama <- asignar_quinquenio(conteo_total_tama)
+conteo_total_santander <- asignar_quinquenio(conteo_total_santander)
+```
+
+La función `conteo_quinquenio()` agrega el número de días extremos por quinquenio y por tipo de extremo (calor o frío). Agrupa el dataframe por las columnas *"quinquenio"* y *"tipo"*, suma los días de todos los años incluidos en cada grupo mediante `sum(dias)`, y devuelve un dataframe con una fila por combinación de quinquenio y tipo. Esta agregación permite cuantificar el total de días extremos acumulados en cada periodo de 5 años y comparar su evolución a lo largo del tiempo.
+```{r message=FALSE, warning=FALSE}
+# Función para sumar el número total de días extremos por quinquenio
+# diferenciando entre calor extremo y frío extremo
+conteo_quinquenio <- function(df) {
+  df %>%
+    group_by(quinquenio, tipo) %>%
+    summarise(dias = sum(dias)) %>%
+    ungroup()
+}
+```
+
+Aplicamos conteo_quinquenio() a los dataframes de cada estación para obtener los totales de días extremos por quinquenio:
+
+ - `quinquenio_tama`: días de calor extremo y frío extremo acumulados por quinquenio en Tama.
+ - `quinquenio_santander`: ídem para Santander.
+```{r message=FALSE, warning=FALSE}
+# Sumar el número total de días extremos por quinquenio para cada estación
+quinquenio_tama <- conteo_quinquenio(conteo_total_tama)
+quinquenio_santander <- conteo_quinquenio(conteo_total_santander)
+```
+
+La función `grafico_quinquenio()` crea un gráfico de barras agrupadas que muestra el número total de días extremos acumulados en cada quinquenio, diferenciando calor extremo (naranja) y frío extremo (azul celeste) mediante colores. Las barras de cada tipo se sitúan una junto a la otra dentro de cada quinquenio (`position_dodge`). El eje *x* representa el quinquenio y el eje *y* el número total de días. El parámetro `mostrar_leyenda` permite suprimir la leyenda en el panel superior cuando los gráficos se combinan verticalmente con patchwork, evitando que aparezca duplicada.
+```{r message=FALSE, warning=FALSE, fig.width=15, fig.height=8}
+# Función para crear un gráfico de barras con el número de días extremos por quinquenio
+# Se diferencian los extremos de calor y frío mediante colores
+grafico_quinquenio <- function(df, titulo, mostrar_leyenda = TRUE) {
+   p <- ggplot(df, aes(x = quinquenio, y = dias, fill = tipo)) +
+     
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+     # Etiquetas del gráfico
+    labs(title = titulo, x = "Quinquenio", y = "Número de días", fill = "Tipo de extremo:") +
+     # Colores personalizados para cada tipo de extremo
+    scale_fill_manual(values = c("Calor Extremo" = "orange", "Frío Extremo" = "deepskyblue")) +
+     
+    guides(fill = guide_legend(nrow = 1)    ) +
+     theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          legend.position = "bottom", legend.direction = "horizontal")
+  
+  if (!mostrar_leyenda) {
+    p <- p + theme(legend.position = "none")
+  }
+
+  return(p)
+}
+```
+
+Generamos los gráficos de barras por quinquenio para cada estación y los combinamos en un panel vertical con patchwork:
+
+ - `grafica_quinquenio_tama`: sin leyenda (se muestra en el gráfico inferior).
+ - `grafica_quinquenio_santander`: con leyenda compartida al pie del panel.
+
+Este panel permite identificar visualmente si los quinquenios más recientes concentran más días de calor extremo y menos días de frío extremo que los periodos históricos, evidenciando el efecto del cambio climático sobre los extremos térmicos a escala regional.
+```{r message=FALSE, warning=FALSE, fig.width=15, fig.height=10, fig.align='center'}
+# Generar gráficos de barras para cada estación utilizando la función definida anteriormente
+grafica_quinquenio_tama <- grafico_quinquenio(quinquenio_tama, "Tama: Días extremos por quinquenio", FALSE)
+grafica_quinquenio_santander <- grafico_quinquenio(quinquenio_santander, "Santander: Días extremos por quinquenio")
+
+# Mostrar gráficos
+grafica_quinquenio_tama / grafica_quinquenio_santander
+```
+
+# Sección  5 - Test de Montecarlo para evaluar la uniformidad de los años de días extremos
+La función `test_montecarlo_extremos()` evalúa mediante simulación si los años en que ocurren los eventos extremos (calor o frío) se distribuyen uniformemente a lo largo del periodo de observación, o si por el contrario se concentran en determinados periodos, lo que sería indicativo de un cambio en el clima regional.
+
+Recibe cuatro parámetros:
+
+ - `df_extremos`: dataframe con los días extremos, que debe contener la columna *"anio"* con el año de cada evento.
+ - `anio_min` y `anio_max`: extremos del periodo de observación de cada estación.
+ - `n_sim`: número de simulaciones Monte Carlo (por defecto 10 000).
+
+El procedimiento es el siguiente:
+
+ 1. Extrae los años reales de los eventos extremos y los normaliza al intervalo [0, 1] para poder comparar con una distribución uniforme estándar.
+ 2. Calcula el estadístico KS real (`D_real`) como la distancia máxima entre la función de distribución acumulada empírica de los años reales y la distribución uniforme teórica.
+ 3. Genera `n_sim` series sintéticas de años muestreados aleatoriamente de forma uniforme en [`anio_min`, `anio_max`] con el mismo número de eventos que la serie real, y calcula el estadístico KS para cada una.
+ 4. Estima el p-valor Monte Carlo como la proporción de simulaciones cuyo KS supera o iguala el KS real, aplicando la corrección **(k+1)/(n_sim+1)** para evitar p-valores exactamente iguales a cero.
+
+Hipótesis:
+
+ - $H_0$: los años de los eventos extremos se distribuyen uniformemente (no hay cambio en la frecuencia a lo largo del tiempo).
+ - $H_1$: los años no se distribuyen uniformemente (los extremos se concentran en ciertos periodos, lo que evidencia un cambio climático).
+
+Si el p-valor es inferior al nivel de significancia (0.05), se rechaza $H_0$ y se concluye que los eventos extremos no son estacionarios en el tiempo.
+
+Devuelve una lista con `D_real`, `p_valor` y el vector de estadísticos KS simulados.
+```{r message=FALSE, warning=FALSE}
+# Función para realizar un test de Montecarlo sobre los años de días extremos
+# Comprueba si los años se distribuyen uniformemente en el intervalo [anio_min, anio_max]
+test_montecarlo_extremos <- function(df_extremos, anio_min, anio_max, n_sim = 10000) {
+  
+  # Extraer los años reales de los extremos
+  anios_reales <- df_extremos$anio
+  
+  # Número de observaciones reales
+  N <- length(anios_reales)
+  
+  # Normalizar los años al intervalo [0,1] para el test KS
+  # (el KS compara contra una distribución uniforme estándar)
+  anios_reales_norm <- (anios_reales - anio_min) / (anio_max - anio_min)
+  
+  # Calcular estadístico KS sobre los datos reales
+  # D_real mide la distancia máxima entre la distribución acumulada real y la uniforme
+  ks_real <- ks.test(anios_reales_norm, "punif")$statistic
+  
+  # Crear vector para guardar estadísticos KS de las simulaciones
+  ks_sim <- numeric(n_sim)
+  
+  # Ciclo de Montecarlo
+  for (i in 1:n_sim) {
+    
+    # Generar N años aleatorios uniformes entre anio_min y anio_max
+    anios_sim <- sample(anio_min:anio_max, N, replace = TRUE)
+    
+    # Normalizar los años simulados al intervalo [0,1]
+    anios_sim_norm <- (anios_sim - anio_min) / (anio_max - anio_min)
+    
+    # Calcular estadístico KS para la simulación
+    ks_sim[i] <- ks.test(anios_sim_norm, "punif")$statistic
+  }
+  
+  # Calcular el p-value tipo Montecarlo
+  # Contar cuántas simulaciones tienen D >= D_real
+  k <- sum(ks_sim >= ks_real)
+  # Aplicar corrección (k+1)/(n_sim+1) para evitar p_valor = 0
+  p_valor <- (k + 1) / (n_sim + 1)
+  
+  # Devolver los resultados en una lista
+  return(list(
+    D_real = ks_real, # Estadístico KS del conjunto real
+    p_valor = p_valor,  # p-valor tipo Montecarlo
+    simulaciones = ks_sim # Vector con los estadísticos KS de todas las simulaciones
+  ))
+}
+```
+
+Aplicamos `test_montecarlo_extremos()` a los días de calor extremo de cada estación. Se usa el año mínimo y máximo de cada serie (obtenidos de los datasets limpios) como extremos del periodo de referencia, de modo que cada estación se evalúa sobre su propio rango temporal.
+```{r message=FALSE, warning=FALSE}
+# Aplicamos el test de Montecarlo a los días de calor extremo para cada estación
+resultado_tama <- test_montecarlo_extremos(dias_calor_tama, 
+                                           min(datos_tama$anio), 
+                                           max(datos_tama$anio)
+                                           )
+resultado_santander <- test_montecarlo_extremos(dias_calor_santander, 
+                                                min(datos_santander$anio), 
+                                                max(datos_santander$anio)
+                                                )
+```
+
+Mostramos los resultados del test para los días de calor extremo en una tabla que recoge, para cada estación, el estadístico KS real (`D_real`) y el p-valor Monte Carlo obtenido. Un p-valor muy pequeño (muy inferior a 0.05) indica que los días de calor extremo se concentran de forma estadísticamente significativa en los años más recientes, rechazando la hipótesis de estacionariedad.
+```{r message=FALSE, warning=FALSE}
+# Mostramos los resultados en una tabla
+data.frame(
+  Estacion = c("Tama", "Santander"),
+  D_real = c(resultado_tama$D_real,
+             resultado_santander$D_real),
+  p_valor = c(resultado_tama$p_valor,
+              resultado_santander$p_valor)
+) %>%
+  knitr::kable(
+    col.names = c(
+      "Estación",
+      "D observado",
+      "p-valor"
+    ),
+    
+    digits = c(NA, 4, 4),
+    
+    caption = paste(
+      "Resultados del contraste para episodios de calor extremo."
+    )
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+Repetimos el mismo procedimiento para los días de frío extremo. La hipótesis que se contrasta es análoga: si los días de frío extremo tampoco se distribuyen uniformemente en el tiempo, y su concentración se produce en los años más antiguos de la serie, ello confirmaría que los inviernos fríos extremos han disminuido en frecuencia en las décadas recientes.
+```{r message=FALSE, warning=FALSE}
+# Repetimos con los días de frío extremo
+resultado_frio_tama <- test_montecarlo_extremos(dias_frio_tama,
+                                                min(datos_tama$anio),
+                                                max(datos_tama$anio)
+                                                )
+resultado_frio_santander <- test_montecarlo_extremos(dias_frio_santander,
+                                                     min(datos_santander$anio),
+                                                     max(datos_santander$anio)
+                                                     )
+```
+
+Mostramos la tabla de resultados del test para los días de frío extremo. Al igual que con el calor, un p-valor muy pequeño indica que los eventos no se distribuyen uniformemente en el tiempo. En este caso la concentración esperada, coherente con el calentamiento regional, sería en los primeros años de cada serie.
+```{r message=FALSE, warning=FALSE}
+data.frame(
+  Estacion = c("Tama", "Santander"),
+  D_real = c(resultado_frio_tama$D_real,
+             resultado_frio_santander$D_real),
+  p_valor = c(resultado_frio_tama$p_valor,
+              resultado_frio_santander$p_valor)
+) %>%
+  knitr::kable(
+    col.names = c(
+      "Estación",
+      "D observado",
+      "p-valor"
+    ),
+    
+    digits = c(NA, 4, 4),
+    
+    caption = paste(
+      "Resultados del contraste para episodios de frío extremo."
+    )
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+Para cada estación y tipo de extremo (calor y frío) se construye un histograma de densidad de los 10 000 estadísticos KS simulados bajo la hipótesis nula de distribución uniforme. Sobre este histograma se superpone una línea vertical que marca el valor real `D_real` observado en los datos. La posición de esta línea respecto a la distribución simulada permite visualizar de forma intuitiva cuán improbable es el valor observado bajo $H_0$: cuanto más a la derecha se sitúe `D_real` respecto a la distribución simulada, menor es el p-valor y más contundente el rechazo de la hipótesis nula.
+
+Los gráficos se presentan por separado para calor extremo y frío extremo, usando facetas (`facet_wrap`) para mostrar ambas estaciones en paneles independientes dentro de una misma figura. Los colores distinguen las estaciones: rosa para Tama y verde oliva para Santander. La ausencia de leyenda es intencional ya que los colores están explicados en el título de cada faceta.
+
+Combinamos los resultados de Montecarlo de las dos estaciones en un único dataframe (`df_calor_combinado`) con las columnas `D_sim` (estadístico KS de cada simulación), `Estacion`, `D_real` y `p_valor`. A partir de este dataframe generamos el gráfico `grafico_montecarlo_combinado_calor`, que muestra en paneles apilados verticalmente el histograma de la distribución nula y el valor observado `D_real` para Tama y para Santander. Las líneas verticales de color más oscuro marcan el `D_real` de cada estación, permitiendo comparar de un vistazo en qué medida los datos reales se alejan de lo esperado bajo estacionariedad.
+```{r message=FALSE, warning=FALSE, fig.width=15, fig.height=8, fig.align='center'}
+# Combinar los resultados de Montecarlo de varias estaciones en un solo dataframe
+df_calor_combinado <- bind_rows(data.frame(D_sim = resultado_tama$simulaciones, 
+                                           Estacion = "Tama", 
+                                           D_real = resultado_tama$D_real, 
+                                           p_valor = resultado_tama$p_valor),
+                                data.frame(D_sim = resultado_santander$simulaciones, 
+                                           Estacion = "Santander", 
+                                           D_real = resultado_santander$D_real, 
+                                           p_valor = resultado_santander$p_valor))
+
+# Crear el gráfico combinado
+grafico_montecarlo_combinado_calor <- ggplot(df_calor_combinado, aes(x = D_sim, fill = Estacion)) +
+  
+  # Histograma de densidad de las simulaciones
+  geom_histogram(aes(y = after_stat(density)), bins = 50, color = "black", alpha = 0.4, position = "identity") +
+  
+  # Línea vertical para el valor observado del estadístico D
+  geom_vline(aes(xintercept = D_real, color = Estacion), size = 1.5) +
+  
+  # Separar gráficos por estación usando facetas
+  facet_wrap(~ Estacion, ncol = 1) +
+  
+  # Etiquetas del gráfico
+  labs(x = expression("Estadístico " * italic(D)), y = "Densidad") +
+  
+  # Colores personalizados para cada estación
+  scale_fill_manual(values = c("Tama" = "palevioletred1", "Santander" = "olivedrab2")) +
+  
+  scale_color_manual(values = c("Tama" = "palevioletred4", "Santander" = "olivedrab4")) +
+  
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Mostrar el gráfico combinado
+grafico_montecarlo_combinado_calor
+```
+
+Repetimos la misma visualización para los días de frío extremo, construyendo `df_frio_combinado` y generando `grafico_montecarlo_combinado_frio`. La estructura del gráfico es idéntica a la del calor: histograma de la distribución nula con la línea `D_real` superpuesta para cada estación. La comparación entre los gráficos de calor y frío permite observar que en ambos casos los valores reales se sitúan muy por encima de los percentiles superiores de la distribución nula, confirmando el rechazo de $H_0$ con una confianza estadística muy elevada en todos los casos.
+```{r message=FALSE, warning=FALSE, fig.width=15, fig.height=8, fig.align='center'}
+# Combinar los resultados de Montecarlo de varias estaciones en un solo dataframe
+df_frio_combinado <- bind_rows(data.frame(D_sim = resultado_frio_tama$simulaciones, 
+                                          Estacion = "Tama", 
+                                          D_real = resultado_frio_tama$D_real, 
+                                          p_valor = resultado_frio_tama$p_valor),
+                               data.frame(D_sim = resultado_frio_santander$simulaciones, 
+                                          Estacion = "Santander", 
+                                          D_real = resultado_frio_santander$D_real, 
+                                          p_valor = resultado_frio_santander$p_valor))
+
+# Crear el gráfico combinado
+grafico_montecarlo_combinado_frio <- ggplot(df_frio_combinado, aes(x = D_sim, fill = Estacion)) +
+  
+  # Histograma de densidad de las simulaciones
+  geom_histogram(aes(y = after_stat(density)), bins = 50, color = "black", alpha = 0.4, position = "identity") +
+  
+  # Línea vertical para el valor observado del estadístico D
+  geom_vline(aes(xintercept = D_real, color = Estacion), size = 1.5) +
+  
+  # Separar gráficos por estación usando facetas
+  facet_wrap(~ Estacion, ncol = 1) +
+  
+  # Etiquetas del gráfico
+  labs(x = expression("Estadístico " * italic(D)), y = "Densidad") +
+  
+  # Colores personalizados para cada estación
+  scale_fill_manual(values = c("Tama" = "palevioletred3", "Santander" = "olivedrab")) +
+  
+  scale_color_manual(values = c("Tama" = "palevioletred4", "Santander" = "olivedrab4")) +
+  
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Mostrar el gráfico combinado
+print(grafico_montecarlo_combinado_frio)
+```
