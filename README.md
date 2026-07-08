@@ -15,23 +15,26 @@ El trabajo compara dos estaciones meteorológicas con entornos contrastados — 
 
 ## Estructura del repositorio
 
+```text
+.
 ├── temperatura/
-│   ├── Bloque1_AnalisisTemperatura.Rmd        # Análisis de extremos térmicos y test de Montecarlo-KS
-│   ├── Bloque1_AnalisisTemperatura.html       # Output renderizado
-│   └── figuras/                               # Gráficas generadas
+│   ├── Bloque1_AnalisisTemperatura.Rmd      # Análisis de extremos térmicos y test de Montecarlo-KS
+│   ├── Bloque1_AnalisisTemperatura.html     # Output renderizado
+│   └── figuras/                            # Gráficas generadas
 │
 ├── precipitacion/
-│   ├── Bloque2_AnalisisPrecipitacion.Rmd      # Análisis del régimen pluviométrico, rachas, PCI/SI y centroide
-│   ├── Bloque2_AnalisisPrecipitacion.html     # Output renderizado
-│   └── figuras/                               # Gráficas generadas
+│   ├── Bloque2_AnalisisPrecipitacion.Rmd    # Análisis del régimen pluviométrico, rachas, PCI/SI y centroide
+│   ├── Bloque2_AnalisisPrecipitacion.html   # Output renderizado
+│   └── figuras/                            # Gráficas generadas
 │
-└── nivel_del_mar/
-│   ├── Bloque3_NivelMar.Rmd                   # Análisis mareográfico: filtro de Godin, análisis armónico y tendencias
-│   ├── Bloque3_NivelMar.html                  # Output renderizado
-│   └── figuras/                               # Gráficas generadas
+├── nivel_del_mar/
+│   ├── Bloque3_NivelMar.Rmd                 # Análisis mareográfico: filtro de Godin, análisis armónico y tendencias
+│   ├── Bloque3_NivelMar.html                # Output renderizado
+│   └── figuras/                            # Gráficas generadas
 │
 └── descarga_datos/
-    └── descarga_datosAEMET.ipynb              # Descarga y curado de datos vía API AEMET
+    └── descarga_datosAEMET.ipynb            # Descarga y curado de datos vía API AEMET
+```
 
 ---
 
