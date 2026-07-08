@@ -13,6 +13,19 @@ El trabajo compara dos estaciones meteorológicas con entornos contrastados — 
 
 ---
 
+## Contexto
+
+Este repositorio recoge el código y los datos completos utilizados en el TFM del Máster en Ciencia de Datos de la Universidad de Cantabria, con el objetivo de garantizar la trazabilidad y reproducibilidad del análisis.
+
+---
+
+## Fuentes de datos
+
+- **AEMET** — Datos diarios de temperatura y precipitación descargados mediante la API de datos abiertos de AEMET (Python/requests).
+- **IEO-CSIC** — Registros horarios del nivel del mar del mareógrafo de Santander (facilitados por el Centro Oceanográfico de Santander).
+
+---
+
 ## Estructura del repositorio
 
 ```text
@@ -77,20 +90,3 @@ Para el notebook de descarga de datos (Python):
 ```bash
 pip install requests pandas
 ```
-
----
-
-## Fuentes de datos
-
-- **AEMET** — Datos diarios de temperatura y precipitación descargados mediante la API de datos abiertos de AEMET (Python/requests).
-- **IEO-CSIC** — Registros horarios del nivel del mar del mareógrafo de Santander (facilitados por el Centro Oceanográfico de Santander).
-
----
-
-## Contexto
-
-Este repositorio recoge el código y los datos completos utilizados en el
-TFM del Máster en Ciencia de Datos de la Universidad de Cantabria, con el
-objetivo de garantizar la trazabilidad y reproducibilidad del análisis.
-
-## Estructura del repositorio
