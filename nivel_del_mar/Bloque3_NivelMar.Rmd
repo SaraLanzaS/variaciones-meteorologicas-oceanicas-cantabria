@@ -1,0 +1,1310 @@
+---
+title: "Análisis del nivel del mar en Santander: tendencias de largo plazo, ciclo estacional y valores extremos"
+subtitle: Bloque 3 del TFM *Estudio estadístico de variaciones meteorológicas y oceánicas en Cantabria*"
+author: "Sara Lanza Sarabia"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Este documento implementa el análisis completo del nivel del mar en Santander a partir de los registros horarios del mareógrafo del IEO (1943–2017). El flujo de trabajo comprende:
+
+- Carga y remuestreo de los datos horarios
+- Aplicación del filtro de Godin para eliminar la señal mareal de alta frecuencia
+- Análisis armónico anual mediante `tidem()` para control de calidad de la serie
+- Estimación del nivel medio anual y sus tendencias de largo plazo
+- Análisis del ciclo estacional comparando el periodo histórico (hasta 1995) y el reciente (desde 1996)
+- Evolución de los valores extremos anuales.
+
+Todos los análisis de tendencia se unifican bajo la función `test_mann_kendall()`, idéntica a la utilizada en el bloque de precipitación del TFM, garantizando coherencia metodológica entre todos los análisis.
+
+# Bloque de librerías
+Cargamos las librerías necesarias para el análisis del nivel del mar:
+
+- `tidyverse`: conjunto de paquetes para manipulación, transformación y visualización de datos (incluye `dplyr`, `ggplot2`, `readr`, `tidyr` y `purrr`).
+- `oce`: oceanografía en R: proporciona `tidem()` para el análisis armónico de series mareográficas, equivalente a T-Tide (Pawlowicz et al., 2002).
+- `lubridate`: extracción y conversión de componentes de fechas y horas (`year`, `month`, `day`, `hour`, `floor_date`, `days_in_month`).
+- `zoo`: medias móviles centradas (`rollmean`) y estadísticos en ventana deslizante (`rollapply`) sobre series temporales.
+- `dplyr`: manipulación de dataframes, cargado explícitamente además del `tidyverse` para garantizar disponibilidad de todas sus funciones.
+- `trend`: test de Mann-Kendall estándar (`mk.test`), estimador de Sen (`sens.slope`) con intervalos de confianza y test de Pettitt.
+- `modifiedmk`: test de Mann-Kendall con corrección TFPW para series con autocorrelación significativa de primer orden (`tfpwmk`).
+- `patchwork`: composición de múltiples gráficos en paneles.
+```{r cargas_librerias, echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)   # Manipulación, importación y visualización de datos
+library(oce)         # Análisis de datos oceanográficos y cálculo de índices climáticos
+library(lubridate)   # Manejo de fechas y horas
+library(zoo)         # Series temporales y medias móviles
+library(dplyr)       # Manipulación de dataframes
+library(trend)       # Pruebas de tendencia (Mann-Kendall, Sen's Slope, entre otras)
+library(modifiedmk)  # Mann-Kendall modificado
+library(patchwork)   # Combinación de múltiples gráficos en una sola figura
+```
+
+# Bloque de parámetros globales
+Definimos los dos parámetros globales del análisis:
+
+- `INPUT_CSV`: ruta al fichero unificado con los registros horarios brutos del mareógrafo de Santander, generado a partir de los archivos originales del IEO.
+- `LATITUD`: coordenada geográfica de la estación (43.46° N), necesaria para el análisis armónico con `tidem()`. La latitud determina el valor del parámetro de Coriolis que afecta a la amplitud y fase de los constituyentes dependientes de la rotación terrestre.
+```{r parametros, echo=TRUE, message=FALSE, warning=FALSE}
+INPUT_CSV <- "mareas_santander_unificado_completo.csv"
+LATITUD <- 43.46   # latitud de Santander
+```
+
+# Sección 1 — Carga y filtrado de datos brutos
+Cargamos el fichero unificado con todos los registros horarios del mareógrafo. Se retienen únicamente los registros con _QC_ = 1 (datos validados por el IEO), descartando observaciones con problemas de calidad. Los registros se ordenan cronológicamente con arrange(datetime), paso imprescindible para que lo agrupamientos y operaciones de filtrado posteriores operen sobre la secuencia temporal correcta. El mensaje de diagnóstico imprime el número total de registros válidos y el rango de años cubiertos para verificar que la carga es completa.
+```{r cargar_datos, echo=TRUE, message=FALSE, warning=FALSE}
+df <- read_csv(INPUT_CSV, col_types = cols(datetime = col_datetime())) %>%
+  filter(QC == 1) %>%                        # solo datos validados
+  arrange(datetime)
+
+cat(sprintf("Dataset cargado: %s registros · años %s\n",
+            format(nrow(df), big.mark = "."),
+            paste(sort(unique(df$año)), collapse = ", ")))
+```
+
+# Sección 2 — Remuestreo horario
+Transformamos la serie bruta en una rejilla horaria regular con exactamente un registro por hora. Para ello, truncamos cada marca temporal a la hora entera por defecto (`floor_date`, `unit` = "hour") y promediamos todos los registros que coinciden en esa hora. Este paso es necesario porque tanto el filtro de Godin como el análisis armónico con `tidem()` requieren series igualmente espaciadas; sin el remuestreo, los periodos con registros subhorarios producirían artefactos en ambos análisis. Al dataframe resultante se le añaden columnas de año, mes, día y hora extraídas de `datetime` con `lubridate`, que se utilizan en todos los agrupamientos posteriores.
+```{r remuestreo_horario, echo=TRUE, message=FALSE, warning=FALSE}
+df_horario <- df %>%
+  mutate(datetime_h = floor_date(datetime, unit = "hour")) %>%
+  group_by(datetime_h) %>%
+  summarise(SLEV_m = mean(SLEV_m, na.rm = TRUE), .groups = "drop") %>%
+  rename(datetime = datetime_h) %>%
+  mutate(año  = year(datetime),
+         mes  = month(datetime),
+         dia  = day(datetime),
+         hora = hour(datetime)
+         )
+cat(sprintf("Remuestreado a horario: %s registros\n", format(nrow(df_horario), big.mark = ".")))
+```
+
+# Sección 3 — Filtro de Godin
+El filtro de Godin ($A_m·A_m·A_n$) es el método estándar en oceanografía costera para eliminar la señal mareal y obtener el nivel no mareal de baja frecuencia (`SLEV_godin`). Se implementa convolucionando tres medias móviles de caja: dos de 24 horas ($A_m$) y una de 25 horas ($A_n$). La elección de estas ventanas suprime eficientemente las componentes semidiurnas ($M_2$, $S_2$) y diurnas ($K_1$, $O_1$) sin distorsionar la señal de baja frecuencia de interés.
+
+- `pgodin()`: calcula los 71 coeficientes de la respuesta al impulso del filtro mediante convolución sucesiva (`convolve`, `type` = "open"). Los coeficientes se normalizan por su suma para garantizar ganancia unitaria (el filtro preserva exactamente la componente de nivel medio). El mensaje de verificación confirma que el filtro tiene 71 coeficientes, suma exactamente 1 y es perfectamente simétrico, condición necesaria para que no introduzca desfase temporal.
+- `aplicar_godin()`: aplica los coeficientes mediante `stats::filter()` con `sides` = 2 (convolución centrada). Los primeros y últimos 35 valores de cada año quedan como NA, lo cual es correcto y esperado dado el semiancho del filtro.
+
+La aplicación se realiza año a año (`group_modify`) para evitar contaminación entre años consecutivos. Para cada año se construye primero una rejilla horaria completa mediante `left_join` (incluyendo horas sin dato como NA) y luego se aplica el filtro. El resultado se guarda en `mareas_santander_filtrado_R.csv`.
+```{r filtro_godin_alternativo, echo=TRUE, message=FALSE, warning=FALSE}
+# 3. Filtro de Godin  (Am · Am · An)
+
+pgodin <- function(m = 24L, n = 25L) {
+  am <- rep(1/m, m)
+  an <- rep(1/n, n)
+  w <- convolve(convolve(am, rev(am), type = "open"), rev(an), type = "open")
+  w / sum(w)
+}
+
+aplicar_godin <- function(serie_slev, m = 24L, n = 25L) {
+  pesos <- pgodin(m, n)
+
+  stats::filter(serie_slev, filter = pesos, method = "convolution", sides = 2
+                ) |> as.numeric()
+}
+
+pesos_test <- pgodin()
+cat(sprintf("   Pesos: %d · Suma: %.8f · Simétrico: %s\n",
+            length(pesos_test),
+            sum(pesos_test),
+            ifelse(all(abs(pesos_test - rev(pesos_test)) < 1e-12), "Sí", "No")
+))
+
+# ------------------------------------------------------------
+# Aplicación por año (evita artefactos en bordes largos)
+# ------------------------------------------------------------
+
+df_filtrado <- df_horario %>%
+  group_by(año) %>%
+  group_modify(function(bloque, key) {
+
+    rng <- seq(min(bloque$datetime),
+               max(bloque$datetime),
+               by = "hour")
+
+    serie <- tibble(datetime = rng) %>%
+      left_join(
+        bloque %>% select(datetime, SLEV_m),
+        by = "datetime"
+      )
+
+    serie$SLEV_godin <- aplicar_godin(serie$SLEV_m)
+
+    # NO incluir 'año' aquí
+    tibble(datetime   = serie$datetime, SLEV_m = serie$SLEV_m, SLEV_godin = serie$SLEV_godin)
+  }) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# Resumen
+# ------------------------------------------------------------
+write_csv(
+  df_filtrado %>%
+    select(datetime, año, SLEV_m, SLEV_godin), "mareas_santander_filtrado_R.csv", na = "")
+```
+
+La tabla de resumen anual muestra para cada año el número de observaciones filtradas válidas y las estadísticas básicas de `SLEV_godin`, permitiendo detectar visualmente años con cobertura reducida o valores anómalos.
+```{r resumen_godin, echo=TRUE, message=FALSE, warning=FALSE}
+df_filtrado %>%
+  filter(!is.na(SLEV_godin)) %>%
+  group_by(año) %>%
+  summarise(
+    n_filtrados = n(),
+    media = mean(SLEV_godin, na.rm = TRUE),
+    minimo = min(SLEV_godin, na.rm = TRUE),
+    maximo = max(SLEV_godin, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    col.names = c("Año", "N.º de observaciones", "Media filtrada (m)", 
+                  "Nivel mínimo (m)", "Nivel máximo (m)"),
+    digits = c(0, 0, 4, 4, 4),
+    caption = paste("Resumen anual de la serie de nivel del mar filtrada mediante el filtro de Godin.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+# Sección 4 — Análisis armónico
+El análisis armónico anual se usa principalmente como herramienta de control de calidad, no como método alternativo de eliminación de la marea (que ya realizó el filtro de Godin). Comparando la estabilidad de los constituyentes a lo largo de los años se pueden detectar periodos con problemas instrumentales.
+
+Para cada año se construye un objeto `sealevel` del paquete `oce` con la serie horaria y la latitud de la estación, y se ajusta el modelo armónico con `tidem()`.
+
+La función auxiliar `get_amplitud()` extrae la amplitud de un constituyente por nombre, devolviendo NA si no fue ajustado ese año. De cada ajuste se acumulan en resumen_armonico: las amplitudes de $M_2$, $S_2$ y $N_2$ (los tres constituyentes principales en Santander), el nivel medio anual ($Z_0$) y la desviación estándar del residuo (`sd_residuo`), que es el principal indicador de calidad del ajuste. Un `sd_residuo` elevado indica que el ajuste no ha podido capturar bien la señal, ya sea por datos insuficientes, errores instrumentales o episodios meteorológicos extremos. Los años con menos de 200 registros horarios se omiten.
+
+La inspección automática al final del bucle marca como anómalos los años cuya amplitud de $M_2$ se desvía más de 2 `sd` de la mediana, o cuya `sd_residuo` supera la mediana más 2 `sd`.
+
+El año 1983 resulta anómalo en ambos criterios, con $M_2 ≈ 1.08$ m frente a ~1.31 m habitual y `sd_residuo` de 0.272 m frente a 0.08-0.12 m en el resto de la serie, indicando un probable error instrumental. Este resultado no afecta a los análisis basados en `SLEV_godin` pero se documenta para transparencia. La tabla completa muestra los estadísticos ordenados cronológicamente para su inspección visual.
+```{r analisis_armonico, echo=TRUE, message=FALSE, warning=FALSE}
+# ─────────────────────────────────────────────────────────────
+# Análisis armónico anual (control de calidad)
+# Verifica la estabilidad de los constituyentes mareales y detecta
+# posibles anomalías instrumentales. Los resultados se almacenan
+# en resumen_armonico (Pawlowicz et al., 2002; equivalente a T-Tide).
+# ─────────────────────────────────────────────────────────────
+
+años_disponibles <- sort(unique(df_horario$año))
+
+resumen_armonico <- tibble(
+  año=integer(), n_registros=integer(),
+  amplitud_M2=double(), amplitud_S2=double(), amplitud_N2=double(),
+  nivel_medio=double(), sd_residuo=double()
+)
+
+for (año_actual in años_disponibles) {
+
+  bloque <- df_horario %>%
+    filter(año==año_actual) %>%
+    arrange(datetime)
+
+  if (nrow(bloque) < 200) {
+    message(sprintf("Año %d: datos insuficientes (%d registros) — omitido",
+                    año_actual, nrow(bloque)))
+    next
+  }
+
+  # Objeto oce y análisis armónico
+  sl_oce <- as.sealevel(elevation=bloque$SLEV_m, time=bloque$datetime,
+                        latitude=LATITUD, stationName="Santander IEO-TG")
+
+  modelo <- tidem(sl_oce)
+
+  # Señal residual
+  predicha <- predict(modelo)
+  residuo  <- bloque$SLEV_m - predicha
+
+  # Amplitud de un constituyente
+  get_amplitud <- function(nombre) {
+    idx <- which(modelo[["name"]]==nombre)
+    if (length(idx)==0) return(NA_real_)
+    modelo[["amplitude"]][idx]
+  }
+
+  resumen_armonico <- resumen_armonico %>%
+    add_row(
+      año=año_actual,
+      n_registros=nrow(bloque),
+      amplitud_M2=get_amplitud("M2"),
+      amplitud_S2=get_amplitud("S2"),
+      amplitud_N2=get_amplitud("N2"),
+      nivel_medio=get_amplitud("Z0"),
+      sd_residuo=sd(residuo, na.rm=TRUE)
+    )
+}
+
+# ─────────────────────────────────────────────────────────────
+# Inspección de años potencialmente anómalos
+# ─────────────────────────────────────────────────────────────
+
+resumen_armonico %>%
+  mutate(
+    m2_anomalo = abs(amplitud_M2 - median(amplitud_M2, na.rm=TRUE)) >
+      2*sd(amplitud_M2, na.rm=TRUE),
+    sd_anomalo = sd_residuo >
+      median(sd_residuo, na.rm=TRUE) +
+      2*sd(sd_residuo, na.rm=TRUE)
+  ) %>%
+  filter(m2_anomalo | sd_anomalo) %>%
+  mutate(m2_anomalo=ifelse(m2_anomalo,"Sí","No"), sd_anomalo=ifelse(sd_anomalo,"Sí","No")
+  ) %>%
+  select(año, n_registros, amplitud_M2, sd_residuo, m2_anomalo, sd_anomalo) %>%
+  knitr::kable(
+    col.names=c("Año","N.º registros","Amplitud M2 (m)", "SD residuo (m)","M2 anómalo","Residuo anómalo"),
+    digits=c(0,0,4,4,NA,NA),
+    caption=paste("Años con posibles anomalías detectadas en la componente armónica M2",
+                  "o en la variabilidad residual del ajuste.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options=c("striped","hover","condensed"),
+    full_width=FALSE,
+    position="center"
+  )
+```
+
+```{r tabla_armonica, echo=TRUE, message=FALSE, warning=FALSE}
+# ─────────────────────────────────────────────────────────────
+# Resumen del análisis armónico anual
+# ─────────────────────────────────────────────────────────────
+resumen_armonico %>%
+  arrange(año) %>%
+  knitr::kable(
+    col.names = c("Año","N.º registros","Amplitud M2 (m)", "Amplitud S2 (m)","Amplitud N2 (m)",
+                  "Nivel medio Z0 (m)","SD residuo (m)"),
+    digits = c(0,0,4,4,4,4,4),
+    caption = paste(
+      "Resultados del análisis armónico anual.",
+      "Se muestran las amplitudes de los constituyentes principales",
+      "M2, S2 y N2, el nivel medio anual (Z0) y la desviación estándar del residuo",
+      "como indicador de calidad del ajuste."
+    )
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped","hover","condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+# Sección 5 - Análisis de tendencia
+
+La función `test_mann_kendall()` centraliza todos los análisis de tendencia del documento y es idéntica a la usada en los bloques de temperatura y precipitación, garantizando coherencia metodológica en todo el TFM. Integra en una única llamada cuatro análisis:
+
+1. **DETECCIÓN DE AUTOCORRELACIÓN**: calcula el ACF en el lag 1 y lo compara con el intervalo de confianza al 95% $(1.96 / √n)$. El umbral depende del tamaño muestral de cada serie concreta, lo que hace la selección de método más rigurosa que un umbral fijo. La serie del nivel medio anual presenta un $ACF_{lag-1}$ muy elevado (~0.76), por lo que siempre se selecciona TFPW.
+
+2. **SELECCIÓN AUTOMÁTICA DEL MÉTODO** (`metodo` = "auto"):
+- Si |acf_lag1| <= 1.96/√n: test de Mann-Kendall estándar (`mk.test`).
+- Si |acf_lag1| > 1.96/√n: test con corrección TFPW (`tfpwmk`), que elimina la tendencia lineal antes del blanqueo para evitar que la propia tendencia infle artificialmente el estadístico.
+
+  En ambos casos se extraen el estadístico tau de Kendall y el p-valor.
+
+3. **ESTIMADOR DE SEN**: calcula la pendiente mediana de Theil-Sen con su intervalo de confianza al 95% siempre sobre la serie original (antes de cualquier transformación). La pendiente se expresa en m/año y se convierte a mm/año en los informes multiplicando por 1000.
+
+4. **TEST DE PETTITT**: detecta el año de cambio más probable en el nivel medio de la serie sin asumir normalidad. El índice K se traduce automáticamente al año correspondiente mediante un join con el dataframe de entrada, buscando la columna "anio" o "inicio_anio" según cuál esté disponible.
+
+Devuelve un tibble de una fila con todos los estadísticos, sus p-valores y los niveles de significancia codificados (** $p$<0.01, * $p$<0.05, . $p$<0.10), compatible con `bind_rows()` para tablas resumen de múltiples series.
+```{r test_mk_function, echo=TRUE, message=FALSE, warning=FALSE}
+test_mann_kendall <- function(df, variable, serie_label = "", metodo = "auto") {
+
+  # ── Preparar serie y evaluar autocorrelación lag-1 ───────────────
+  serie <- df %>%
+    arrange(across(any_of(c("anio", "inicio_anio")))) %>%
+    pull({{ variable }})
+
+  serie <- serie[!is.na(serie)]
+  n <- length(serie)
+
+  acf_lag1 <- acf(serie, lag.max = 1, plot = FALSE)$acf[2]
+  limite_acf <- 1.96 / sqrt(n)
+
+  # ── Selección automática del método ──────────────────────────────
+  metodo_usado <- if (metodo == "auto") {
+    ifelse(abs(acf_lag1) > limite_acf, "tfpw", "estandar")
+  } else {
+    metodo
+  }
+
+  # ── Test de Mann-Kendall (estándar o TFPW) ───────────────────────
+  if (metodo_usado == "estandar") {
+
+    mk <- mk.test(serie)
+    tau <- unname(mk$estimates["tau"])
+    p_valor <- mk$p.value
+
+  } else if (metodo_usado == "tfpw") {
+
+    mk <- tfpwmk(serie)
+    tau <- unname(mk[grep("Tau", names(mk), ignore.case = TRUE)])
+    p_valor <- unname(mk[grep("p.value|P.value", names(mk), ignore.case = TRUE)])
+  }
+
+  # ── Pendiente de Sen y test de Pettitt ───────────────────────────
+  sen <- sens.slope(serie)
+  pt  <- pettitt.test(serie)
+
+  k_anio <- df %>%
+    arrange(across(any_of(c("anio", "inicio_anio")))) %>%
+    filter(!is.na({{ variable }})) %>%
+    slice(as.integer(pt$estimate[1])) %>%
+    pull(any_of(c("anio", "inicio_anio")))
+
+  # ── Resumen de resultados ────────────────────────────────────────
+  tibble(
+    serie      = serie_label,
+    metodo     = metodo_usado,
+    acf_lag1   = round(acf_lag1, 3),
+    tau        = round(tau, 4),
+    p_valor_mk = round(p_valor, 4),
+
+    sen_slope  = round(sen$estimates, 4),
+    sen_inf    = round(sen$conf.int[1], 4),
+    sen_sup    = round(sen$conf.int[2], 4),
+
+    interpretacion = case_when(p_valor < 0.05 & sen_slope > 0 ~ "Creciente",
+                               p_valor < 0.05 & sen_slope < 0 ~ "Decreciente",
+                               TRUE ~ "Sin tendencia clara"),
+
+    signif_mk = case_when(p_valor < 0.01 ~ "**", p_valor < 0.05 ~ "*", p_valor < 0.10 ~ ".", TRUE ~ ""),
+
+    K_anio = if (length(k_anio) > 0) as.integer(k_anio) else NA_integer_,
+    p_valor_pt = round(pt$p.value, 4),
+
+    signif_pt = case_when(pt$p.value < 0.01 ~ "**", pt$p.value < 0.05 ~ "*",
+                          pt$p.value < 0.10 ~ ".",TRUE ~ "")
+  )
+}
+```
+
+# Sección 6 — Nivel medio anual
+Calculamos el nivel medio anual (NMM) como la media de SLEV_godin sobre todos los registros horarios válidos de cada año natural. Se excluyen los años con menos de 8 000 horas de datos filtrados válidos (~91% de cobertura), umbral que garantiza que el NMM no esté sesgado por ausencias sistemáticas en épocas de máximo o mínimo estacional. De los 75 años de la serie (1943-2017), 59 superan este umbral y constituyen la base del análisis de tendencia. 
+
+La columna _año_ se renombra a _anio_ para compatibilidad con `test_mann_kendall()` y con el resto de funciones del documento. En paralelo se ajusta la regresión lineal (`modelo_lm`) y se calcula la tasa de subida en mm/año (`tasa_mm_anio`) como referencia complementaria al MK.
+```{r nivel_medio_anual, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Nivel medio anual a partir del filtro de Godin
+nivel_medio_anual <- df_filtrado %>%
+  filter(!is.na(SLEV_godin)) %>%
+  group_by(año) %>%
+  summarise(
+    NMM       = mean(SLEV_godin, na.rm = TRUE),
+    n_horas   = n(),
+    .groups   = "drop"
+  ) %>%
+  filter(n_horas >= 8000)  # excluir años incompletos (~330 días * 24h)
+
+# Tendencia lineal (mm/año)
+modelo_lm <- lm(NMM ~ año, data = nivel_medio_anual)
+tasa_mm_anio <- coef(modelo_lm)["año"] * 1000  # convertir m a mm
+nivel_medio_anual <- nivel_medio_anual %>% rename(anio = año)
+```
+
+## 6.1 - Tabla de tendencia del NMM
+Aplicamos test_mann_kendall() a la serie de nivel medio anual y enriquecemos el tibble resultante con los tres estadísticos de la regresión lineal:
+
+- `pendiente_lm_mm_anio`: pendiente de la regresión en mm/año.
+- `ee_lm_mm_anio`: error estándar de la pendiente, que cuantifica la precisión de la estimación lineal.
+- `r2_ajustado`: coeficiente de determinación ajustado, que indica qué fracción de la varianza interanual del NMM explica la tendencia lineal.
+
+Las pendientes de Sen se convierten a mm/año (× 1000) antes de presentar la tabla, para que todas las tasas de cambio sean directamente comparables entre sí y con los valores de la literatura (García et al., 2.38 mm/año, 1943-2010). La tabla formateada con kableExtra agrupa en una sola vista los resultados del MK, el estimador de Sen con su IC 95% y los resultados de la regresión lineal, junto con el punto de cambio de Pettitt.
+```{r}
+# ── Resumen de tendencias del nivel medio anual del mar ─────────────
+test_mann_kendall(
+  nivel_medio_anual,
+  NMM,
+  "Santander - Nivel medio del mar"
+) %>%
+  mutate(
+    pendiente_lm_mm_anio = round(coef(modelo_lm)["año"] * 1000, 3),
+    ee_lm_mm_anio        = round(summary(modelo_lm)$coefficients[2, "Std. Error"] * 1000, 3),
+    r2_ajustado          = round(summary(modelo_lm)$adj.r.squared, 3),
+
+    sen_mm_anio      = round(sen_slope * 1000, 3),
+    sen_inf_mm_anio  = round(sen_inf * 1000, 3),
+    sen_sup_mm_anio  = round(sen_sup * 1000, 3)
+  ) %>%
+  select(
+    serie, metodo, tau, p_valor_mk, signif_mk,
+    sen_mm_anio, sen_inf_mm_anio, sen_sup_mm_anio,
+    pendiente_lm_mm_anio, ee_lm_mm_anio, r2_ajustado,
+    K_anio, p_valor_pt, signif_pt
+  ) %>%
+  knitr::kable(
+    col.names = c("Serie", "Método MK", "Tau", "p-valor MK", "Sig. MK", "Pendiente Sen (mm/año)", 
+                  "IC 95% inf.", "IC 95% sup.", "Pendiente LM (mm/año)", "Error estándar LM (mm/año)",
+                  "R² ajustado", "Año cambio Pettitt", "p-valor Pettitt", "Sig. Pettitt"),
+    digits = c(NA, NA, 4, 4, NA, 3, 3, 3, 3, 3, 3, 0, 4, NA),
+    caption = paste(
+      "Tendencia del nivel medio anual del mar en Santander.",
+      "Se presentan los resultados de Mann-Kendall,",
+      "la pendiente de Sen, la regresión lineal y el test de cambio de régimen de Pettitt."
+    )
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+
+## 6.2 - Gráfico del nivel medio anual
+Construimos la visualización completa del NMM en cuatro etapas:
+
+1. **PREPARACIÓN DE DATOS**: se calculan sobre nivel_medio_anual la media móvil centrada de 5 años (rollmean) y la desviación estándar en ventana de 5 años (`rollapply`, FUN = sd), que alimentan respectivamente la línea suavizada y la banda de dispersión del gráfico.
+
+2. **TEST DE PETTITT INDEPENDIENTE**: se calcula directamente sobre el vector NMM para obtener el año de cambio (`k_anio_nmm`) y su p-valor (`p_pt_nmm`), que determinan si se añade la línea vertical en el gráfico.
+
+3. **LÍNEA DE SEN**: se calcula la pendiente mediana (`slope_nmm`) y se construye el tibble sen_nmm con los dos puntos extremos de la recta, anclada en la mediana de los años (`med_a`) y la mediana de los valores (`med_v`).
+
+4. **GRÁFICO**: combina cuatro capas analíticas — banda ±1 sd (geom_ribbon en turquesa semitransparente), serie anual (puntos y línea fina), media móvil de 5 años (línea más gruesa) y línea de Sen (rojo) — con el punto de cambio de Pettitt añadido condicionalmente mediante { if (p_pt_nmm < 0.05) list(...) } para que solo aparezca cuando el cambio es estadísticamente significativo.
+
+```{r nivel_medio_anual_completo2, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# ── Preparar datos con media móvil y sd ──────────────────────────────
+nivel_plot <- nivel_medio_anual %>%
+  arrange(anio) %>%
+  mutate(
+    media_movil = zoo::rollmean(NMM, k = 5, fill = NA, align = "center"),
+    sd_movil    = zoo::rollapply(NMM, width = 5, FUN = sd,
+                                 fill = NA, align = "center")
+  )
+
+# ── Test de Pettitt sobre nivel medio anual ───────────────────────────
+pt_nmm <- pettitt.test(nivel_medio_anual$NMM)
+k_idx  <- as.integer(pt_nmm$estimate[1])
+k_anio_nmm <- nivel_medio_anual$anio[k_idx]
+p_pt_nmm   <- pt_nmm$p.value
+
+cat("Pettitt nivel medio: año =", k_anio_nmm,
+    "| p-valor =", round(p_pt_nmm, 4), "\n")
+
+# ── Línea de Sen ──────────────────────────────────────────────────────
+slope_nmm <- as.numeric(sens.slope(nivel_medio_anual$NMM)$estimates)
+med_a     <- median(nivel_medio_anual$anio)
+med_v     <- median(nivel_medio_anual$NMM)
+
+sen_nmm <- tibble(
+  x    = c(min(nivel_medio_anual$anio), max(nivel_medio_anual$anio)),
+  ysen = med_v + slope_nmm * (c(min(nivel_medio_anual$anio),
+                                 max(nivel_medio_anual$anio)) - med_a)
+)
+
+# ── Gráfica ───────────────────────────────────────────────────────────
+p_nmm <- ggplot(nivel_plot, aes(x = anio, y = NMM)) +
+
+  # Banda de dispersión ±1 sd (ventana 5 años)
+  geom_ribbon(
+    aes(ymin = media_movil - sd_movil,
+        ymax = media_movil + sd_movil),
+    fill = "turquoise", alpha = 0.15, na.rm = TRUE
+  ) +
+
+  # Puntos anuales
+  geom_point(color = "turquoise4", size = 1.5, alpha = 0.6) +
+
+  # Serie anual como línea fina
+  geom_line(color = "turquoise", linewidth = 0.5, alpha = 0.5) +
+
+  # Media móvil 5 años
+  geom_line(aes(y = media_movil), color = "paleturquoise4", linewidth = 1.0, na.rm = TRUE) +
+
+  # Línea de Sen
+  geom_line(data = sen_nmm, aes(x = x, y = ysen), color = "firebrick", linewidth = 0.9,
+            linetype = "solid", inherit.aes = FALSE) +
+
+  # Punto de cambio Pettitt (solo si significativo)
+  { if (p_pt_nmm < 0.05) {
+      list(
+        geom_vline(xintercept = k_anio_nmm, color = "chartreuse2",
+                   linetype = "dotdash", linewidth = 0.8),
+        annotate("text",
+                 x = k_anio_nmm + 1,
+                 y = min(nivel_medio_anual$NMM, na.rm = TRUE),
+                 label = paste0("Cambio: ", k_anio_nmm),
+                 hjust = 0, vjust = 0, size = 2.8, color = "chartreuse4")
+      )
+  }} +
+
+  labs(title = "Nivel medio anual del mar — Santander (1943-2017)",
+       subtitle = "Puntos: valores anuales   |   Línea azul: media móvil 5 años   |   Línea roja discontinua: pendiente Sen   |   Banda: ±1 sd",
+       x = "Año", y = "Nivel medio del mar (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 8, color = "grey50"),
+    panel.grid.minor = element_blank()
+  )
+
+p_nmm
+```
+
+# Sección 7 — Variabilidad decenal
+## 7.1 - Tabla de tendencias decenales
+Para contextualizar la tendencia de largo plazo en el marco de la variabilidad interdecadal, agrupamos el NMM por décadas y calculamos cuatro estadísticos: `n` (número de años válidos), `media_NMM`, `sd_NMM` (que cuantifica la variabilidad dentro de la década) y `tendencia_lm` (tasa de cambio interna estimada con lm(NMM ~ anio), expresada en mm/año). Esta última solo se calcula cuando la década tiene al menos 5 años válidos (`n()` >= 5); en caso contrario se devuelve NA para evitar estimaciones con soporte estadístico insuficiente.
+
+Las tendencias internas deben interpretarse con cautela dado el escaso número de observaciones por década, especialmente en los 40 (6 años) y los 90 (4 años). La tabla formateada presenta las décadas ordenadas cronológicamente.
+```{r tendencias_decadales, echo=TRUE, message=FALSE, warning=FALSE}
+tendencias_decadales <- nivel_medio_anual %>%
+  mutate(decada = floor(anio / 10) * 10) %>%
+  group_by(decada) %>%
+  summarise(
+    n          = n(),
+    media_NMM  = round(mean(NMM, na.rm = TRUE), 4),
+    sd_NMM     = round(sd(NMM,   na.rm = TRUE), 4),
+    tendencia_lm = if (n() >= 5) {
+      round(coef(lm(NMM ~ anio, data = cur_data()))["anio"] * 1000, 2)
+    } else NA_real_,
+    .groups = "drop"
+  )
+```
+
+```{r tabla_tendencias_decadales, echo=TRUE, message=FALSE, warning=FALSE}
+tendencias_decadales %>%
+  arrange(decada) %>%
+  knitr::kable(
+    col.names = c("Década", "N.º años", "Media NMM (m)", "Desv. estándar NMM (m)", 
+                  "Tendencia lineal (mm/año)"),
+    digits = c(0, 0, 4, 4, 2),
+    
+    caption = paste("Variabilidad y tendencia decadal del nivel medio del mar (NMM).",
+                    "La tendencia lineal se estima mediante regresión sobre el año y se expresa en mm/año.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+## 7.2 - Diagnóstico de años excluidos
+Para documentar exhaustivamente los 16 años que no superan el umbral de 8000 horas y justificar que su exclusión no compromete la estimación de la tendencia de largo plazo, generamos cuatro tablas de diagnóstico con granularidad progresiva:
+
+1. `nivel_medio_anual_completo`: recalcula el NMM y el número de horas para todos los años sin aplicar el filtro de validez, permitiendo identificar cuáles quedan excluidos. Un mensaje `cat()` resume los totales.
+
+2. `tabla_anios_excluidos`: lista los 16 años excluidos con su número de horas disponibles, ordenados cronológicamente. Permite verificar que no están todos concentrados en el mismo periodo.
+
+3. `tabla_cobertura_decadal`: resume por décadas el número de años totales, válidos y el porcentaje de validez. Revela que la mayor concentración de exclusiones está en los 80 y 90, coincidiendo con problemas instrumentales conocidos en el mareógrafo.
+
+4. `cobertura_mensual_excluidos` y `cobertura_excluidos`: para cada uno de los 16 años excluidos calculan la cobertura horaria de cada mes y la clasifican en cuatro estados: OK (≥90%), Parcial (50-90%), Escaso (<50%) o sin dato (—). La función `complete()` garantiza que los meses sin ningún registro aparezcan explícitamente como 0 en lugar de quedar ausentes de la tabla.
+
+La tabla pivotada (`tabla_cobertura_limpia`) muestra una fila por año con el estado de cada mes en columnas. El resumen (tabla_resumen_excluidos) cuenta los meses en cada categoría y evalúa si el año podría recuperarse con criterios menos estrictos (al menos 10 meses OK y no más de 2 meses completamente sin dato). Ambas tablas se presentan con kableExtra.
+```{r nivel_medio_anual_completo, echo=TRUE, message=FALSE, warning=FALSE}
+# Años excluidos por no superar el umbral de 8000 horas
+nivel_medio_anual_completo <- df_filtrado %>%
+  filter(!is.na(SLEV_godin)) %>%
+  mutate(anio = year(datetime)) %>%
+  group_by(anio) %>%
+  summarise(
+    NMM = mean(SLEV_godin, na.rm = TRUE),
+    n_horas = n(),
+    .groups = "drop"
+  )
+
+# Resumen
+cat("Total años en la serie:", nrow(nivel_medio_anual_completo), "\n")
+cat("Años válidos (>= 8000h):", sum(nivel_medio_anual_completo$n_horas >= 8000), "\n")
+cat("Años excluidos (< 8000h):", sum(nivel_medio_anual_completo$n_horas < 8000), "\n")
+
+nivel_medio_anual_completo %>%
+  filter(n_horas < 8000) %>%
+  select(anio, n_horas
+  ) %>%
+  arrange(anio) %>%
+  knitr::kable(
+    col.names = c("Año", "Horas disponibles"),
+    digits = c(0, 0),
+    caption = paste("Años excluidos del cálculo del nivel medio del mar anual",
+                    "por no alcanzar el umbral mínimo de 8000 horas de datos.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"
+    ),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+```{r tabla_cobertura_decadal, echo=TRUE, message=FALSE, warning=FALSE}
+nivel_medio_anual_completo %>%
+  mutate(valido = n_horas >= 8000, decada = floor(anio / 10) * 10
+  ) %>%
+  group_by(decada) %>%
+  summarise(
+    n_total = n(),
+    n_validos = sum(valido),
+    pct_valid = round(100 * mean(valido), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(decada) %>%
+  knitr::kable(
+    col.names = c("Década", "Años totales", "Años válidos (≥8000 h)", "Porcentaje válido (%)"),
+    digits = c(0, 0, 0, 1),
+    
+    caption = paste("Distribución temporal de la disponibilidad de datos para el cálculo",
+                    "del nivel medio del mar anual.",
+                    "Se consideran válidos los años con al menos 8000 horas de registros.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+```{r cobertura_mensual_excluidos_tabla, echo=TRUE, message=FALSE, warning=FALSE}
+# Tabla de cobertura mensual por año excluido
+anios_excluidos <- c(1943, 1955, 1963, 1984, 1985, 1988, 1989, 1991, 
+                     1992, 1993, 1994, 1995, 1999, 2007, 2008, 2017)
+
+cobertura_excluidos <- df_filtrado %>%
+  filter(!is.na(SLEV_godin)) %>%
+  mutate(anio = year(datetime), mes  = month(datetime)
+  ) %>%
+  filter(anio %in% anios_excluidos) %>%
+  group_by(anio, mes) %>%
+  summarise(horas_mes = n(), .groups = "drop") %>%
+  # Completar con 0 los meses sin ningún dato
+  complete(anio, mes = 1:12, fill = list(horas_mes = 0)) %>%
+  mutate(
+    horas_esperadas = days_in_month(
+      as.Date(paste(anio, mes, "01", sep = "-"))
+    ) * 24,
+    cobertura_pct = round(100 * horas_mes / horas_esperadas, 1),
+    estado = case_when(cobertura_pct >= 90 ~ "OK", cobertura_pct >= 50 ~ "Parcial",
+                       cobertura_pct >  0  ~ "Escaso", TRUE                ~ "—"),
+    mes_label = factor(
+      c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")[mes],
+      levels = c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")
+    )
+  )
+```
+
+```{r tabla_cobertura_excluidos, echo=TRUE, message=FALSE, warning=FALSE}
+# Tabla de cobertura mensual por año excluido
+cobertura_excluidos %>%
+  select(anio, mes_label, estado
+  ) %>%
+  pivot_wider(names_from = mes_label, values_from = estado
+  ) %>%
+  arrange(anio) %>%
+  knitr::kable(
+    col.names = c("Año", "Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"),
+    caption = paste("Cobertura mensual de datos en años excluidos del cálculo",
+                    "del nivel medio del mar anual.",
+                    "Los estados indican disponibilidad mensual:",
+                    "OK (≥90%), Parcial (50–90%), Escaso (<50%)."),
+    align = c("c", rep("c", 12))
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+```{r tabla_resumen_excluidos, echo=TRUE, message=FALSE, warning=FALSE}
+# Resumen: cuántos meses OK tiene cada año excluido
+cobertura_excluidos %>%
+  group_by(anio) %>%
+  summarise(
+    meses_ok = sum(estado == "OK"),
+    meses_parcial = sum(estado == "Parcial"),
+    meses_escasos = sum(estado == "Escaso"),
+    meses_sin_dato = sum(estado == "—"),
+    meses_problematicos = sum(estado != "OK"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    recuperable = meses_ok >= 10 & meses_sin_dato <= 2
+  ) %>%
+  arrange(anio) %>%
+  knitr::kable(
+    col.names = c("Año", "Meses OK", "Meses parciales", "Meses escasos",
+                  "Meses sin dato", "Meses problemáticos", "Recuperable"),
+    digits = c(0, 0, 0, 0, 0, 0, NA),
+    caption = paste("Resumen de cobertura mensual en años excluidos.",
+                    "Se evalúa el número de meses con cobertura suficiente",
+                    "y la posibilidad de recuperación del año según el criterio",
+                    "de al menos 10 meses OK y máximo 2 meses sin datos.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+# Sección 8 — Ciclo estacional: comparación histórico vs reciente
+Calculamos las medias mensuales del nivel filtrado por Godin separando el periodo histórico (hasta 1995) del reciente (desde 1996). Para cada mes y periodo se obtienen la media y la desviación estándar de todos los registros horarios válidos de ese mes en ese periodo (directamente sobre los datos horarios, sin agrupar por año). El dataframe resultante (`ciclo_comparado`) se utiliza como insumo para el gráfico de líneas comparativo entre periodos.
+```{r ciclo_estacional_comparado, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Ciclo estacional por periodo — nivel del mar
+ciclo_comparado <- df_filtrado %>%
+  filter(!is.na(SLEV_godin)) %>%
+  mutate(
+    mes     = month(datetime),
+    periodo = ifelse(year(datetime) <= 1995, "Histórico (1943-1995)", "Reciente (1996-2017)")
+  ) %>%
+  group_by(periodo, mes) %>%
+  summarise(
+    NMM_mes = mean(SLEV_godin, na.rm = TRUE),
+    sd_mes  = sd(SLEV_godin,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mes_label = factor(
+      c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")[mes],
+      levels = c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")
+    )
+  )
+```
+
+## 8.1 - Medias mensuales anuales y gráfico del ciclo estacional
+Para los tests estadísticos del ciclo estacional se necesita una unidad de análisis que evite la pseudorreplicación que surgiría al comparar directamente los millones de datos horarios. La unidad correcta es la media mensual anual: la media de `SLEV_godin` para cada combinación de año y mes.
+
+`medias_mensuales` se construye con dos filtros encadenados:
+
+- `n_horas` >= 600: excluye los meses con menos de ~25 días de datos válidos, para evitar que meses con grandes lagunas temporales sesguen la media mensual.
+- `anio %in% nivel_medio_anual$anio`: restringe a los años que superan el umbral de 8 000 horas, garantizando coherencia con el análisis de nivel medio anual y evitando que los años de baja calidad contaminen los tests.
+La columna `periodo` usa etiquetas cortas (_historico_/_reciente_) para facilitar el filtrado en los tests de Wilcoxon y Mann-Kendall mensual.
+
+```{r medias_mensuales_anuales, echo=TRUE, message=FALSE, warning=FALSE}
+# Medias mensuales anuales
+medias_mensuales <- df_filtrado %>%
+  filter(!is.na(SLEV_godin)) %>%
+  mutate(anio = year(datetime),
+         mes  = month(datetime)) %>%
+  group_by(anio, mes) %>%
+  summarise(NMM_mes = mean(SLEV_godin, na.rm = TRUE),
+            n_horas = n(), .groups = "drop") %>%
+  filter(n_horas >= 600) %>%
+  filter(anio %in% nivel_medio_anual$anio) %>%
+  mutate(periodo = ifelse(anio <= 1995, "historico", "reciente"))
+```
+
+A continuación, `ciclo_por_periodo` agrega medias_mensuales por mes y periodo (con etiquetas largas) para construir el gráfico de líneas comparativo. Las anotaciones de texto sobre cada mes muestran la diferencia de medias entre periodos en centímetros, calculadas pivotando el dataframe a formato ancho con `pivot_wider` y multiplicando la diferencia en metros por 100. Las anotaciones se posicionan ligeramente por encima de la curva superior para no solapar con los datos.
+```{r ciclo_estacional_comparado_completo, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=8, fig.align="center"}
+# ── Ciclo estacional medio por periodo ───────────────────────────────
+ciclo_por_periodo <- medias_mensuales %>%
+  mutate(
+    periodo = ifelse(anio <= 1995, "Histórico (1943-1995)", "Reciente (1996-2017)"),
+    mes_label = factor(
+      c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")[mes],
+      levels = c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")
+    )
+  ) %>%
+  group_by(periodo, mes, mes_label) %>%
+  summarise(
+    media_NMM = mean(NMM_mes),
+    sd_NMM    = sd(NMM_mes),
+    n         = n(),
+    .groups   = "drop"
+  )
+
+ggplot(ciclo_por_periodo,
+       aes(x = mes_label, y = media_NMM, color = periodo, group = periodo)) +
+  
+  # Banda ±1 sd
+  geom_ribbon(
+    aes(ymin = media_NMM - sd_NMM, ymax = media_NMM + sd_NMM, fill = periodo),
+    alpha = 0.15, color = NA
+  ) +
+  
+  # Líneas y puntos
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.5) +
+  
+  # Diferencia entre periodos como anotación
+  geom_text(
+    data = ciclo_por_periodo %>%
+      select(mes_label, periodo, media_NMM) %>%
+      pivot_wider(names_from = periodo, values_from = media_NMM) %>%
+      mutate(
+        dif = round((`Reciente (1996-2017)` - `Histórico (1943-1995)`) * 100, 1),
+        label = paste0("+", dif, " cm")
+      ),
+    aes(x = mes_label,
+        y = max(ciclo_por_periodo$media_NMM + ciclo_por_periodo$sd_NMM, na.rm = TRUE) * 1.01, 
+        label = label),
+    color = "grey30", size = 2.5,
+    inherit.aes = FALSE
+  ) +
+  
+  scale_color_manual(
+    values = c("Histórico (1943-1995)" = "goldenrod3", "Reciente (1996-2017)"  = "seagreen3"),
+    name = NULL
+  ) +
+  scale_fill_manual(
+    values = c("Histórico (1943-1995)" = "goldenrod1", "Reciente (1996-2017)"  = "seagreen2"),
+    name = NULL
+  ) +
+  scale_y_continuous(
+  breaks = seq(0, 10, by = 0.05)
+  ) +
+  labs(
+    title = "Ciclo estacional del nivel del mar — Santander",
+    subtitle = "Media mensual por periodo histórico y reciente   |   Banda: ±1 desviación estándar",
+    x = NULL, y = "Nivel medio (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle   = element_text(hjust = 0.5, size = 9, color = "grey50"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+## 8.2 -  Test de Wilcoxon por mes
+El test de Wilcoxon de suma de rangos (`wilcox.test`, `exact` = `FALSE` porque el tamaño muestral supera los límites de la distribución exacta) compara las distribuciones de las medias mensuales anuales entre el periodo histórico y el reciente, iterando sobre los 12 meses con `map_dfr()`. Es la alternativa no paramétrica al test t y no asume normalidad de las distribuciones.
+
+Para cada mes se calculan las medianas de cada periodo, su diferencia en metros (`dif_mediana`, que cuantifica cuánto ha subido el nivel en ese mes entre periodos), el p-valor y su nivel de significancia codificado en estrellas. El dataframe `wilcox_ciclo` recoge todos los resultados en formato tabular.
+```{r wilcoxon_ciclo, echo=TRUE, message=FALSE, warning=FALSE}
+# Wilcoxon por mes (no paramétrico, equivalente al MK para dos muestras)
+wilcox_ciclo <- map_dfr(1:12, function(m) {
+  
+  hist_vals <- medias_mensuales %>%
+    filter(mes == m, periodo == "historico") %>%
+    pull(NMM_mes)
+  
+  rec_vals <- medias_mensuales %>%
+    filter(mes == m, periodo == "reciente") %>%
+    pull(NMM_mes)
+  
+  wx <- wilcox.test(hist_vals, rec_vals, exact = FALSE)
+  
+  tibble(
+    mes       = m,
+    mes_label = c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")[m],
+    n_hist    = length(hist_vals),
+    n_rec     = length(rec_vals),
+    mediana_hist = round(median(hist_vals), 4),
+    mediana_rec  = round(median(rec_vals),  4),
+    dif_mediana  = round(median(rec_vals) - median(hist_vals), 4),
+    p_valor   = round(wx$p.value, 4),
+    signif    = case_when(wx$p.value < 0.001 ~ "***", wx$p.value < 0.01 ~ "**",
+                          wx$p.value < 0.05 ~ "*", wx$p.value < 0.10 ~ ".", TRUE ~ "")
+  )
+})
+```
+
+## 8.3 - Test t de Student y tabla comparativa
+Aplicamos simultáneamente el test de Wilcoxon y el test t de Welch (`t.test`, sin asumir igualdad de varianzas entre periodos) a las medias mensuales anuales de cada mes, iterando con `map_dfr`(1:12, ...). Producir ambos tests en una única pasada permite compararlos directamente en la misma tabla.
+
+La columna `coinciden` = (`sig_wilcoxon` == `sig_ttest`) señala si ambos métodos asignan el mismo nivel de significancia, lo que refuerza la robustez de las conclusiones cuando coinciden. Para cada mes se incluyen además las medias ± error estándar de cada periodo (se = sd / √n) y el intervalo de confianza al 95% de la diferencia (`ic_inf`, `ic_sup` del t-test).
+
+La tabla presentada con `kableExtra` muestra la diferencia como _media ± semiancho IC 95%_, construida con `sprintf("%.3f ± %.3f", dif_media, (ic_sup - ic_inf) / 2)`, que es más interpretable físicamente que presentar el IC completo en columnas separadas.
+```{r}
+purrr::map_dfr(1:12, function(m) {
+  
+  hist_vals <- medias_mensuales %>%
+    filter(mes == m, periodo == "historico") %>%
+    pull(NMM_mes)
+  
+  rec_vals <- medias_mensuales %>%
+    filter(mes == m, periodo == "reciente") %>%
+    pull(NMM_mes)
+  
+  wx <- wilcox.test(hist_vals, rec_vals, exact = FALSE)
+  tt <- t.test(hist_vals, rec_vals)
+  
+  tibble(
+    mes = m,
+    mes_label = c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")[m],
+    
+    n_hist = length(hist_vals),
+    n_rec = length(rec_vals),
+    
+    media_hist = round(mean(hist_vals), 4),
+    se_hist = round(sd(hist_vals) / sqrt(length(hist_vals)), 4),
+    
+    media_rec = round(mean(rec_vals), 4),
+    se_rec = round(sd(rec_vals) / sqrt(length(rec_vals)), 4),
+    
+    dif_media = round(mean(rec_vals) - mean(hist_vals), 4),
+    ic_inf = round(tt$conf.int[1], 4),
+    ic_sup = round(tt$conf.int[2], 4),
+    
+    p_wilcoxon = round(wx$p.value, 4),
+    sig_wilcoxon = case_when(wx$p.value < 0.001 ~ "***", wx$p.value < 0.01 ~ "**",
+                             wx$p.value < 0.05 ~ "*", wx$p.value < 0.10 ~ ".", TRUE ~ ""),
+    
+    p_ttest = round(tt$p.value, 4),
+    sig_ttest = case_when(tt$p.value < 0.001 ~ "***", tt$p.value < 0.01 ~ "**",
+                          tt$p.value < 0.05 ~ "*", tt$p.value < 0.10 ~ ".", TRUE ~ ""),
+    
+    coinciden = sig_wilcoxon == sig_ttest
+  )
+  
+}) %>%
+  mutate(
+    hist_label = sprintf("%.4f ± %.4f", media_hist, se_hist),
+    rec_label = sprintf("%.4f ± %.4f", media_rec, se_rec),
+    dif_label = sprintf("%.3f ± %.3f", dif_media, (ic_sup - ic_inf) / 2)
+  ) %>%
+  select(mes_label, n_hist, n_rec, hist_label, rec_label, dif_label, p_wilcoxon,
+         sig_wilcoxon, p_ttest, sig_ttest
+  ) %>%
+  knitr::kable(
+    col.names = c("Mes", "N hist.", "N rec.", "Media hist. ± SE (m)", "Media rec. ± SE (m)",
+                  "Diferencia (m)", "p Wilcoxon", "Sig. W", "p t-test", "Sig. t"),
+    caption = paste("Comparación del nivel medio mensual del mar entre periodos.",
+                    "Se muestran los p-valores y significancia del test de Wilcoxon",
+                    "y del test t de Student (Welch).")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+## Test de Mann-Kendall mensual y tabla de resultados
+El test de Mann-Kendall aplicado mes a mes evalúa si existe una tendencia sostenida a lo largo de toda la serie en la media de NMM de cada mes, en lugar de limitarse a comparar dos periodos predefinidos. Se itera con `map_dfr(1:12, ...)` aplicando el mismo criterio de selección automática de método (estándar o TFPW según si |acf_lag1| > 1.96/√n) que en `test_mann_kendall()`. La pendiente de Sen se convierte a mm/año (multiplicando por 1000) y se incluyen los límites del IC al 95% igualmente en mm/año (`sen_inf`, `sen_sup`). Los meses con menos de 10 observaciones se omiten con `return(NULL)`.
+
+La tabla formateada (`tabla_mk_ciclo_mensual`) presenta el IC 95% como una columna unificada _[inf; sup]_ construida con `paste0()`, y se presenta con `kableExtra`. Este análisis es más informativo que la comparación de dos periodos porque cuantifica la tasa de cambio en mm/año para cada mes individualmente, permitiendo identificar si el ciclo estacional se está amplificando (meses de otoño subiendo más rápido que los de primavera), aplanando o desplazando.
+```{r mk_ciclo_mensual, echo=TRUE, message=FALSE, warning=FALSE}
+mk_ciclo_mensual <- map_dfr(1:12, function(m) {
+  
+  serie_m <- medias_mensuales %>%
+    filter(mes == m) %>%
+    arrange(anio)
+  
+  if (nrow(serie_m) < 10) return(NULL)
+  
+  acf1    <- acf(serie_m$NMM_mes, lag.max = 1, plot = FALSE)$acf[2]
+  lim_acf <- 1.96 / sqrt(nrow(serie_m))
+  
+  if (abs(acf1) > lim_acf) {
+    mk   <- tfpwmk(serie_m$NMM_mes)
+    tau  <- unname(mk[grep("Tau", names(mk), ignore.case = TRUE)])
+    pval <- unname(mk[grep("p.value|P.value", names(mk), ignore.case = TRUE)])
+    met  <- "tfpw"
+  } else {
+    mk   <- mk.test(serie_m$NMM_mes)
+    tau  <- unname(mk$estimates["tau"])
+    pval <- mk$p.value
+    met  <- "estandar"
+  }
+  
+  sen <- sens.slope(serie_m$NMM_mes)
+  
+  tibble(
+    mes       = m,
+    mes_label = c("Ene","Feb","Mar","Abr","May","Jun", "Jul","Ago","Sep","Oct","Nov","Dic")[m],
+    metodo    = met,
+    tau       = round(tau, 3),
+    p_valor   = round(pval, 4),
+    sen_mm_anio = round(sen$estimates * 1000, 2),  # convertir a mm/año
+    sen_inf     = round(sen$conf.int[1] * 1000, 2),  # límite inferior IC 95%
+    sen_sup     = round(sen$conf.int[2] * 1000, 2),  # límite superior IC 95%
+    signif    = case_when(pval < 0.001 ~ "***", pval < 0.01  ~ "**",
+                          pval < 0.05  ~ "*", pval < 0.10  ~ ".", TRUE ~ "")
+  )
+})
+```
+
+```{r tabla_mk_ciclo_mensual, echo=TRUE, message=FALSE, warning=FALSE}
+mk_ciclo_mensual %>%
+  arrange(mes) %>%
+  mutate(
+    ic_95 = paste0("[", sen_inf, "; ", sen_sup, "]")
+  ) %>%
+  select(mes_label, metodo, tau, p_valor, sen_mm_anio, ic_95, signif
+  ) %>%
+  knitr::kable(
+    col.names = c("Mes", "Método MK", "Tau", "p-valor MK", "Pendiente Sen (mm/año)",
+                  "IC 95%", "Sig."),
+    digits = c(NA, NA, 3, 4, 2, NA, NA),
+    caption = paste("Tendencia mensual del nivel medio del mar mediante el test de Mann-Kendall.",
+                    "La corrección TFPW se aplica cuando existe autocorrelación",
+                    "significativa de primer orden.",
+                    "Las tendencias se expresan como pendiente de Sen en mm/año.",
+                    "El intervalo de confianza (IC 95%) se obtiene mediante el método de Sen.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+# Seccción 9 - Valores extremos anuales
+## 9.1 - Máximos y mínimos anuales
+Calculamos el máximo (`max_nivel`) y el mínimo (`min_nivel`) de `SLEV_m` en cada año usando los datos horarios brutos de `df_filtrado`, para preservar los picos de alta frecuencia que el filtro de Godin habría eliminado. En lugar de aplicar el umbral de 8 000 horas, se filtra directamente para incluir solo los años que forman parte de `nivel_medio_anual` (`anio %in% nivel_medio_anual$anio`), garantizando que la base de análisis de extremos sea exactamente la misma que la del nivel medio. La extracción de año se realiza con `year(datetime`) antes del agrupamiento, ya que `df_filtrado` no tiene columna _anio_ sino _año_.
+
+La función auxiliar `make_sen_line()` calcula los dos puntos extremos de la recta de Theil-Sen para una variable dada: extrae la pendiente mediana con `sens.slope()`, la ancla en la mediana de los años (`med_a`) y la mediana de los valores (`med_v`), y devuelve un tibble de dos filas con las coordenadas (`x`, `ysen`) del inicio y fin de la recta. Incluye una salvaguarda que devuelve un tibble vacío si hay menos de 3 valores válidos, evitando errores en series muy cortas.
+
+```{r extremos, echo=TRUE, message=FALSE, warning=FALSE}
+# Máximos anuales del nivel del mar
+extremos_anuales <- df_filtrado %>%
+  filter(!is.na(SLEV_m)) %>%
+  mutate(anio = year(datetime)) %>%
+  group_by(anio) %>%
+  summarise(
+    max_nivel = max(SLEV_m),
+    min_nivel = min(SLEV_m),
+    n_horas = n(),
+    .groups="drop"
+  ) %>%
+  filter(anio %in% nivel_medio_anual$anio)
+```
+
+```{r}
+# Renombrar primero para compatibilidad
+make_sen_line <- function(df, variable) {
+  vals  <- na.omit(df[[variable]])
+  anios <- df$anio[!is.na(df[[variable]])]
+  
+  if (length(vals) < 3) return(tibble(x = numeric(0), ysen = numeric(0)))
+  
+  slope <- as.numeric(sens.slope(vals)$estimates)
+  med_a <- median(anios)
+  med_v <- median(vals)
+  tibble(x = c(min(anios), max(anios)), ysen = med_v + slope * (c(min(anios), max(anios)) - med_a))
+}
+```
+
+# 9.2 Tendencias en los extremos
+La función `plot_extremo_nivel()` encapsula la visualización de una variable de extremo anual para evitar duplicar código entre el gráfico de máximos y el de mínimos. Recibe el dataframe de extremos, el nombre de la variable, el título del panel y tres parámetros de color. Internamente:
+
+- Calcula con zoo la media móvil de 5 años (`rollmean`) y la sd en ventana de 5 años (`rollapply`), que forman la línea suavizada y la banda ±1 sd.
+- Calcula directamente la línea de Sen (sin usar `make_sen_line()`) anclando slope × (x − med_a) + med_v en los extremos del eje temporal.
+- Aplica el test de Pettitt y añade la línea de cambio condicionalmente mediante `{ if (p_pt < 0.05) list(...) }`. La etiqueta Sen en mm/año se calcula con `sprintf("%+.2f", slope * 1000)`.
+
+Los gráficos `p_max` (extremos máximos, rojo oscuro) y `p_min` (extremos mínimos, azul marino) se componen en un panel vertical con `patchwork` (operador /), con un pie de figura que describe la codificación visual.
+
+A continuación se aplica `test_mann_kendall()` a ambas series de extremos y se construye tabla_mk_extremos_limpia convirtiendo las pendientes de Sen de metros a mm/año (× 1000) para facilitar la comparación directa con la tasa de ascenso del nivel medio. La tabla se presenta con kableExtra incluyendo las pendientes, los IC 95% y el punto de cambio de Pettitt.
+```{r extremos_panel, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=8, fig.align="center"}
+# ── Función auxiliar para no repetir código ───────────────────────────
+plot_extremo_nivel <- function(datos, variable, titulo_panel,
+                                color_serie, color_media, color_sen) {
+  
+  # Preparar datos con media móvil y sd
+  df_plot <- datos %>%
+    arrange(anio) %>%
+    mutate(
+      media_movil = zoo::rollmean(.data[[variable]], k = 5,
+                                  fill = NA, align = "center"),
+      sd_movil    = zoo::rollapply(.data[[variable]], width = 5,
+                                   FUN = sd, fill = NA, align = "center")
+    )
+  
+  # Línea de Sen
+  vals  <- datos[[variable]]
+  anios <- datos$anio
+  slope <- as.numeric(sens.slope(vals)$estimates)
+  med_a <- median(anios)
+  med_v <- median(vals)
+  
+  sen_df <- tibble(
+    x    = c(min(anios), max(anios)),
+    ysen = med_v + slope * (c(min(anios), max(anios)) - med_a)
+  )
+  
+  # Pettitt
+  pt     <- pettitt.test(vals)
+  k_idx  <- as.integer(pt$estimate[1])
+  k_anio <- anios[k_idx]
+  p_pt   <- pt$p.value
+  
+  # Etiqueta Sen en mm/año
+  sen_lab <- paste0("Sen: ", sprintf("%+.2f", slope * 1000), " mm/año")
+  
+  p <- ggplot(df_plot, aes(x = anio, y = .data[[variable]])) +
+    
+    # Banda ±1 sd
+    geom_ribbon(
+      aes(ymin = media_movil - sd_movil, ymax = media_movil + sd_movil),
+      fill = color_serie, alpha = 0.15, na.rm = TRUE
+    ) +
+    
+    # Puntos y línea anual
+    geom_line(color  = color_serie, linewidth = 0.5, alpha = 0.5) +
+    geom_point(color = color_serie, size = 1.5,      alpha = 0.6) +
+    
+    # Media móvil
+    geom_line(aes(y = media_movil), color = color_media, linewidth = 1.0, na.rm = TRUE) +
+    
+    # Línea de Sen
+    geom_line(data = sen_df, aes(x = x, y = ysen), color = color_sen, linewidth = 0.9,
+              linetype = "dashed", inherit.aes = FALSE) +
+    
+    # Punto de cambio Pettitt si significativo
+    { if (p_pt < 0.05) list(
+        geom_vline(xintercept = k_anio, color = "chartreuse2", linetype = "dotdash", linewidth = 0.8),
+        annotate("text", x = k_anio + 1, y = min(vals, na.rm = TRUE), label = paste0("Cambio: ", k_anio),
+                 hjust = 0, vjust = 0, size = 2.8, color = "chartreuse4")
+    )} +
+    
+    labs(title = titulo_panel, x = "Año", y = "Nivel del mar (m) "
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(size = 9),
+      axis.text = element_text(size = 8)
+    )
+  
+  return(p)
+}
+
+# ── Llamadas ──────────────────────────────────────────────────────────
+p_max <- plot_extremo_nivel(extremos_anuales, variable = "max_nivel", titulo_panel = "Máximo anual",
+                            color_serie = "firebrick", color_media = "darkred", color_sen  = "darkred")
+
+p_min <- plot_extremo_nivel(extremos_anuales, variable = "min_nivel", titulo_panel = "Mínimo anual",
+                            color_serie = "steelblue", color_media = "navy", color_sen = "navy")
+
+# ── Combinar en un panel vertical ─────────────────────────────────────
+p_max / p_min +
+  plot_annotation(
+    caption = "Puntos: valores anuales   |   Línea oscura: media móvil 5 años   |   Línea discontinua: pendiente Sen   |   Banda: ±1 sd   |   Línea naranja: punto de cambio Pettitt",
+    theme   = theme(
+      plot.caption = element_text(hjust = 0.5, size = 8, color = "grey50")
+    )
+  )
+```
+
+```{r}
+# Asegurarse de que extremos_anuales tiene columna anio (no año)
+#extremos_anuales <- extremos_anuales #%>% rename(anio = año)
+
+# Aplicar test_mann_kendall a máximos y mínimos
+tabla_mk_extremos <- bind_rows(
+  test_mann_kendall(extremos_anuales, max_nivel, "Santander - Máximo anual nivel del mar"),
+  test_mann_kendall(extremos_anuales, min_nivel, "Santander - Mínimo anual nivel del mar")
+)
+```
+
+```{r tabla_mk_extremos_limpia, echo=TRUE, message=FALSE, warning=FALSE}
+tabla_mk_extremos %>%
+  mutate(sen_mm_anio = round(sen_slope * 1000, 3),
+         sen_inf_mm_anio = round(sen_inf * 1000, 3),
+         sen_sup_mm_anio = round(sen_sup * 1000, 3)
+  ) %>%
+  select(serie, metodo, tau, p_valor_mk, signif_mk, sen_mm_anio, sen_inf_mm_anio,
+         sen_sup_mm_anio, K_anio, p_valor_pt, signif_pt
+  ) %>%
+  knitr::kable(
+    col.names = c("Serie", "Método MK", "Tau", "p-valor MK", "Sig. MK", "Pendiente Sen (mm/año)",
+                  "IC 95% inf. (mm/año)", "IC 95% sup. (mm/año)", "Año cambio Pettitt",
+                  "p-valor Pettitt", "Sig. Pettitt"),
+    digits = c(NA, NA, 4, 4, NA, 3, 3, 3, 0, 4, NA),
+    caption = paste("Tendencia de los extremos anuales del nivel del mar mediante",
+                    "el test de Mann-Kendall, la pendiente de Sen y el test de Pettitt.",
+                    "Las pendientes se expresan en mm/año para facilitar la interpretación",
+                    "del cambio del nivel del mar.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+# 9.4 - Comparación entre periodos para los extremos
+Todo el análisis de comparación entre periodos para los extremos anuales se integra en un único chunk consolidado que ejecuta secuencialmente:
+
+1. **PARTICIÓN EN PERIODOS**: `extremos_periodos` añade la columna `periodo` (_Histórico (1943-1995)_ o _Reciente (1996-2017)_) filtrando con `n_horas` >= 8000 para asegurar que solo entran años con cobertura suficiente. Los vectores `hist` y `rec` extraen los valores de cada variable por periodo.
+
+2. **FUNCIÓN `sig_test()`**: codifica p-valores en estrellas de significancia de forma consistente en toda la tabla (*** p<0.001, ** p<0.01, * p<0.05).
+
+3. **TESTS ESTADÍSTICOS**: se aplican Wilcoxon (`wx_max`, `wx_min`) y t-test de Welch (`tt_max`, `tt_min`) a máximos y mínimos por separado. La doble verificación refuerza la robustez: si ambos tests coinciden en el nivel de significancia, la señal no depende de los supuestos del test.
+
+4. **TABLA RESUMEN (`tabla_extremos`)**: combina en una sola vista las medias ± desviación estándar de cada variable en cada periodo (formateadas con `sprintf` como _%.3f ± %.3f_), el cambio medio entre periodos en metros (redondeado a 3 decimales) y los p-valores y significancias de ambos tests. Los p-valores muy pequeños se muestran como $<0.0001$ con `ifelse` para evitar notación científica. Se presenta con `knitr::kable()` sin `kableExtra` dado que el chunk ya es extenso.
+
+5. **BOXPLOT COMPARATIVO**: `pivot_longer` transforma `max_nivel` y `min_nivel` en una variable "tipo" con sus valores en "nivel", generando un boxplot de dos facetas con `geom_boxplot` (caja con mediana y cuartiles, outliers marcados con cruces `outlier.shape` = 4) y geom_jitter (puntos individuales con jitter para mostrar la distribución real). El eje x se suprime (`axis.text.x = element_blank()`) ya que la distinción entre periodos se hace por color de relleno (dorado = histórico, verde = reciente).
+```{r}
+# Crear periodos, extraer extremos y realizar comparación estadística
+
+extremos_periodos <- extremos_anuales %>%
+  filter(n_horas >= 8000) %>%
+  mutate(periodo = ifelse(anio <= 1995, "Histórico (1943-1995)", "Reciente (1996-2017)"))
+
+# Función de significancia
+sig_test <- function(p){
+  ifelse(p < 0.001, "***", 
+         ifelse(p < 0.01, "**", 
+                ifelse(p < 0.05, "*", ".")))
+  }
+
+# Datos separados por periodo
+hist <- extremos_periodos %>%
+  filter(periodo == "Histórico (1943-1995)")
+
+rec <- extremos_periodos %>%
+  filter(periodo == "Reciente (1996-2017)")
+
+# Tests estadísticos
+wx_max <- wilcox.test(hist$max_nivel, rec$max_nivel, exact = FALSE)
+tt_max <- t.test(hist$max_nivel, rec$max_nivel)
+
+wx_min <- wilcox.test(hist$min_nivel, rec$min_nivel, exact = FALSE)
+tt_min <- t.test(hist$min_nivel, rec$min_nivel)
+```
+
+```{r}
+# Tabla resumen
+tibble(
+  variable = c("Máximo anual", "Mínimo anual"),
+  n_hist = c(nrow(hist), nrow(hist)),
+  n_rec = c(nrow(rec), nrow(rec)),
+  media_hist = c(mean(hist$max_nivel), mean(hist$min_nivel)),
+  sd_hist = c(sd(hist$max_nivel), sd(hist$min_nivel)),
+  media_rec = c(mean(rec$max_nivel), mean(rec$min_nivel)),
+  sd_rec = c(sd(rec$max_nivel), sd(rec$min_nivel)),
+  cambio = c(mean(rec$max_nivel) - mean(hist$max_nivel),mean(rec$min_nivel) - mean(hist$min_nivel)),
+  p_wilcoxon = c(wx_max$p.value, wx_min$p.value),
+  sig_wilcoxon = c(sig_test(wx_max$p.value), sig_test(wx_min$p.value)),
+  p_ttest = c(tt_max$p.value, tt_min$p.value),
+  sig_ttest = c(sig_test(tt_max$p.value), sig_test(tt_min$p.value))
+) %>%
+  mutate(
+    media_hist_sd = sprintf("%.3f ± %.3f", media_hist, sd_hist),
+    media_rec_sd = sprintf("%.3f ± %.3f", media_rec, sd_rec),
+    cambio = round(cambio, 3),
+    p_wilcoxon = ifelse(p_wilcoxon < 0.0001, "<0.0001", sprintf("%.4f", p_wilcoxon)),
+    p_ttest = ifelse(p_ttest < 0.0001, "<0.0001", sprintf("%.4f", p_ttest))
+  ) %>%
+  select(variable, n_hist, n_rec, media_hist_sd, media_rec_sd, cambio, p_wilcoxon,
+         sig_wilcoxon, p_ttest, sig_ttest
+  ) %>%
+  knitr::kable(
+    col.names = c("Variable", "N hist.", "N rec.", "Media hist. ± SD (m)", "Media rec. ± SD (m)",
+                  "Cambio medio (m)", "p Wilcoxon", "Sig.", "p t-test", "Sig."),
+    escape = FALSE,
+    caption = paste("Comparación de los máximos y mínimos anuales del nivel del mar",
+                    "entre el periodo histórico y el reciente.")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+```{r extremos_boxplot, echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6, fig.align="center"}
+# Boxplot comparativo por periodo
+extremos_periodos %>%
+  pivot_longer(cols = c(max_nivel, min_nivel), names_to = "tipo", values_to = "nivel") %>%
+  mutate(tipo = ifelse(tipo == "max_nivel", "Máximo anual", "Mínimo anual")) %>%
+  ggplot(aes(x = periodo, y = nivel, fill = periodo)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 4) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 1.5) +
+  scale_fill_manual(values = c("Histórico (1943-1995)" = "goldenrod1", 
+                               "Reciente (1996-2017)"  = "seagreen2"),
+                    name = NULL) +
+  facet_wrap(~tipo, scales = "free_y") +
+  labs(title = "Distribución de extremos del nivel del mar — Santander\nComparación histórico vs reciente",
+       x = NULL, y = "Nivel del mar (m)") +
+  theme_minimal() +
+  theme(plot.title      = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "bottom",
+        strip.text      = element_text(face = "bold"),
+        axis.text.x     = element_blank(),
+        axis.ticks.x    = element_blank())
+```
